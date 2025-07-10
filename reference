@@ -1,0 +1,634 @@
+import os
+import time
+import csv
+import hashlib
+import gc
+import psutil
+import shutil
+import tempfile
+import gzip
+import json
+import threading
+from datetime import datetime
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from openpyxl import load_workbook
+
+# =========== User Config ============
+SCAN_ALL_MODE = True
+
+# 🚀 新增選項：選擇處理模式
+USE_PARALLEL_PROCESSING = True  # True=多線程平行, False=單線程逐個處理
+
+WATCH_FOLDERS = [
+    r"\\network_drive\\your_folder1",
+    r"\\network_drive\\your_folder2"
+]
+
+MANUAL_BASELINE_TARGET = [
+    r"\\network_drive\\your_folder1\\somefile.xlsx",
+    r"\\network_drive\\your_folder2\\subfolder"
+]
+
+LOG_FOLDER = r".\\excel_watch_log"
+LOG_FILE_DATE = datetime.now().strftime('%Y%m%d')
+CSV_LOG_FILE = os.path.join(LOG_FOLDER, f"excel_change_log_{LOG_FILE_DATE}.csv.gz")
+SUPPORTED_EXTS = ('.xlsx', '.xlsm')
+
+MAX_RETRY = 10
+RETRY_INTERVAL_SEC = 2
+USE_TEMP_COPY = True
+
+WHITELIST_USERS = ['ckcm0210', 'yourwhiteuser']
+LOG_WHITELIST_USER_CHANGE = True
+
+FORCE_BASELINE_ON_FIRST_SEEN = [
+    r"\\network_drive\\your_folder1\\must_first_baseline.xlsx",
+    "force_this_file.xlsx"
+]
+# =========== End User Config ============
+
+def get_all_excel_files(folders):
+    all_files = []
+    for folder in folders:
+        if os.path.isfile(folder):
+            if folder.lower().endswith(SUPPORTED_EXTS) and not os.path.basename(folder).startswith('~$'):
+                all_files.append(folder)
+        elif os.path.isdir(folder):
+            for dirpath, _, filenames in os.walk(folder):
+                for f in filenames:
+                    if f.lower().endswith(SUPPORTED_EXTS) and not f.startswith('~$'):
+                        all_files.append(os.path.join(dirpath, f))
+    return all_files
+
+def get_memory_mb():
+    try:
+        gc.collect()
+        process = psutil.Process(os.getpid())
+        mem = process.memory_info().rss / 1024 / 1024
+        return mem
+    except Exception as e:
+        print(f"[DEBUG][get_memory_mb] Error: {e}")
+        return 0
+
+def get_excel_last_author(path):
+    try:
+        wb = load_workbook(path, read_only=True)
+        author = wb.properties.lastModifiedBy
+        wb.close()
+        return author
+    except Exception as e:
+        print(f"[ERROR][get_excel_last_author] {path} 無法讀取 last author: {e}")
+        return None
+
+# 🛠️ 修正 datetime 序列化問題
+def serialize_cell_value(value):
+    """
+    將 cell value 轉換成 JSON 可序列化的格式
+    """
+    if value is None:
+        return None
+    elif isinstance(value, datetime):
+        return value.isoformat()  # 轉換成 ISO 格式字串 e.g. "2024-12-01T15:30:00"
+    elif hasattr(value, '__iter__') and not isinstance(value, (str, bytes)):
+        # 處理 list, tuple 等
+        return [serialize_cell_value(item) for item in value]
+    else:
+        return value
+
+def dump_excel_cells_with_formula(path):
+    try:
+        wb_formula = load_workbook(path, data_only=False)
+        wb_value = load_workbook(path, data_only=True)
+        result = {}
+        for ws_formula, ws_value in zip(wb_formula.worksheets, wb_value.worksheets):
+            ws_data = {}
+            for row_formula, row_value in zip(ws_formula.iter_rows(), ws_value.iter_rows()):
+                for cell_formula, cell_value in zip(row_formula, row_value):
+                    try:
+                        formula = cell_formula.value if cell_formula.data_type == "f" else None
+                        value = cell_value.value
+                        
+                        # 🛠️ 序列化 value，處理 datetime
+                        value = serialize_cell_value(value)
+                        
+                        if formula or (value not in [None, ""]):
+                            if formula is not None:
+                                formula = str(formula)
+                                if not formula.startswith("="):
+                                    formula = "=" + formula
+                                if not formula.startswith("'="):
+                                    formula = "'" + formula
+                            ws_data[cell_formula.coordinate] = {
+                                "formula": formula,
+                                "value": value
+                            }
+                    except Exception as e:
+                        print(f"[ERROR][dump_excel_cells_with_formula] 讀cell error: {e} @ {cell_formula.coordinate}")
+                        ws_data[cell_formula.coordinate] = {
+                            "formula": None,
+                            "value": None
+                        }
+            if ws_data:
+                result[ws_formula.title] = ws_data
+        wb_formula.close()
+        wb_value.close()
+        return result
+    except Exception as e:
+        print(f"[ERROR][dump_excel_cells_with_formula] {path} 無法讀取 Excel cell: {e}")
+        return {}
+
+def hash_excel_content(cells_dict):
+    try:
+        flat = [
+            (ws, coord, dct.get("formula"), dct.get("value"))
+            for ws, ws_dict in cells_dict.items()
+            for coord, dct in ws_dict.items()
+        ]
+        return hashlib.md5(str(sorted(flat)).encode('utf-8')).hexdigest()
+    except Exception as e:
+        print(f"[ERROR][hash_excel_content] hash 失敗: {e}")
+        return None
+
+def baseline_file_path(base_name):
+    return os.path.join(LOG_FOLDER, f"{base_name}.baseline.json.gz")
+
+def load_baseline(baseline_file):
+    try:
+        if os.path.exists(baseline_file):
+            with gzip.open(baseline_file, 'rt', encoding='utf-8') as f:
+                return json.load(f)
+        return None
+    except Exception as e:
+        print(f"[ERROR][load_baseline] error loading {baseline_file}: {e}")
+        return None
+
+def save_baseline(baseline_file, data):
+    try:
+        with gzip.open(baseline_file, 'wt', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        print(f"[INFO] Baseline 建立於 {os.path.abspath(baseline_file)}")
+    except Exception as e:
+        print(f"[ERROR][save_baseline] error saving {baseline_file}: {e}")
+
+def safe_get(val, key, default=None):
+    try:
+        if isinstance(val, dict):
+            return val.get(key, default)
+        return default
+    except Exception as e:
+        print(f"[DEBUG][safe_get] error: {e}")
+        return default
+
+def compare_cells(old, new):
+    changes = []
+    old = old or {}
+    new = new or {}
+    try:
+        for ws in new:
+            old_ws = old.get(ws, {})
+            new_ws = new[ws]
+            all_cells = set(new_ws.keys()) | set(old_ws.keys())
+            for cell in all_cells:
+                old_val = old_ws.get(cell, {"formula": None, "value": None})
+                new_val = new_ws.get(cell, {"formula": None, "value": None})
+                if old_val != new_val:
+                    changes.append({
+                        "worksheet": ws,
+                        "cell": cell,
+                        "old_formula": safe_get(old_val, "formula"),
+                        "old_value": safe_get(old_val, "value"),
+                        "new_formula": safe_get(new_val, "formula"),
+                        "new_value": safe_get(new_val, "value")
+                    })
+        for ws in old:
+            if ws not in new:
+                for cell, old_val in old[ws].items():
+                    changes.append({
+                        "worksheet": ws,
+                        "cell": cell,
+                        "old_formula": safe_get(old_val, "formula"),
+                        "old_value": safe_get(old_val, "value"),
+                        "new_formula": None,
+                        "new_value": None
+                    })
+        return changes
+    except Exception as e:
+        print(f"[ERROR][compare_cells] error during comparison: {e}")
+        return []
+
+def log_changes_csv(csv_log_file, file_path, last_author, changes):
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        os.makedirs(os.path.dirname(csv_log_file), exist_ok=True)
+    except Exception as e:
+        print(f"[ERROR][log_changes_csv] 無法建立 log 資料夾: {e}")
+        return
+    try:
+        file_exists = os.path.exists(csv_log_file)
+        with gzip.open(csv_log_file, 'at', encoding='utf-8', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            if not file_exists:
+                writer.writerow([
+                    "timestamp", "file", "worksheet", "cell", "old_formula", "old_value", "new_formula", "new_value", "last_author"
+                ])
+            for change in changes:
+                def prep_formula(val):
+                    try:
+                        if val is None:
+                            return ""
+                        s = str(val)
+                        if not s.startswith("'="):
+                            if s.startswith("="):
+                                s = "'" + s
+                            else:
+                                s = "'=" + s
+                        return s
+                    except Exception as e:
+                        print(f"[DEBUG][log_changes_csv>prep_formula] {e}")
+                        return ""
+                writer.writerow([
+                    now,
+                    file_path,
+                    change['worksheet'],
+                    change['cell'],
+                    prep_formula(change['old_formula']),
+                    change['old_value'],
+                    prep_formula(change['new_formula']),
+                    change['new_value'],
+                    last_author
+                ])
+    except Exception as e:
+        print(f"[ERROR][log_changes_csv] 無法寫入 log: {e}")
+
+def print_console_header():
+    print("\n" + "="*80)
+    print(" Excel File Change Watcher ".center(80, "-"))
+    print("="*80 + "\n")
+
+def print_event(msg, char="-"):
+    print(char*80)
+    print(msg)
+    print(char*80)
+
+def print_cell_changes_summary(changes, max_show=10):
+    try:
+        print(f"  變更 cell 數量：{len(changes)}")
+        for i, change in enumerate(changes[:max_show]):
+            ws = change['worksheet']
+            cell = change['cell']
+            oldf = change['old_formula']
+            oldv = change['old_value']
+            newf = change['new_formula']
+            newv = change['new_value']
+            print(f"    [{ws}] {cell}: [公式:{oldf}] [值:{oldv}]  →  [公式:{newf}] [值:{newv}]")
+        if len(changes) > max_show:
+            print(f"    ... 其餘 {len(changes) - max_show} 個 cell 省略 ...")
+    except Exception as e:
+        print(f"[ERROR][print_cell_changes_summary] {e}")
+
+def is_force_baseline_file(filepath):
+    try:
+        lowerfile = filepath.lower()
+        for pattern in FORCE_BASELINE_ON_FIRST_SEEN:
+            if pattern.lower() in lowerfile:
+                return True
+        return False
+    except Exception as e:
+        print(f"[DEBUG][is_force_baseline_file] {e}")
+        return False
+
+# ============= Baseline 處理函數 ===============
+
+def human_readable_size(num_bytes):
+    for unit in ['B','KB','MB','GB','TB']:
+        if num_bytes < 1024.0:
+            return f"{num_bytes:,.2f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.2f} PB"
+
+def _baseline_worker(file_path, skip_force_baseline):
+    '''
+    Worker function for one file. 
+    Returns (filename, baseline_file, baseline_size_bytes, error_msg_or_None, start_time, end_time)
+    '''
+    worker_start = time.time()
+    start_time_str = datetime.now().strftime('%H:%M:%S')
+    
+    base_name = os.path.basename(file_path)
+    baseline_file = baseline_file_path(base_name)
+    
+    try:
+        if skip_force_baseline and is_force_baseline_file(file_path):
+            worker_end = time.time()
+            end_time_str = datetime.now().strftime('%H:%M:%S')
+            return (file_path, None, 0, "skip_force_baseline", start_time_str, end_time_str)
+        
+        # 實際處理 Excel
+        cell_data = dump_excel_cells_with_formula(file_path)
+        curr_author = get_excel_last_author(file_path)
+        curr_hash = hash_excel_content(cell_data)
+        
+        # 建立 baseline 資料夾
+        os.makedirs(os.path.dirname(baseline_file), exist_ok=True)
+        
+        # 🛠️ 儲存 baseline，現在能正確處理 datetime
+        with gzip.open(baseline_file, 'wt', encoding='utf-8') as f:
+            json.dump({
+                "last_author": curr_author,
+                "content_hash": curr_hash,
+                "cells": cell_data
+            }, f, ensure_ascii=False, indent=2)
+        
+        size = os.path.getsize(baseline_file)
+        worker_end = time.time()
+        end_time_str = datetime.now().strftime('%H:%M:%S')
+        
+        return (file_path, baseline_file, size, None, start_time_str, end_time_str)
+        
+    except Exception as e:
+        worker_end = time.time()
+        end_time_str = datetime.now().strftime('%H:%M:%S')
+        return (file_path, baseline_file, 0, str(e), start_time_str, end_time_str)
+
+def create_baseline_for_files(xlsx_files, skip_force_baseline=True):
+    '''
+    建立 baseline，支援平行或單線程模式
+    '''
+    total = len(xlsx_files)
+    if total == 0:
+        print("[INFO] 沒有需要 baseline 的檔案。")
+        return
+
+    print()
+    print("=" * 90)
+    print(" BASELINE 建立程序 ".center(90, "="))
+    print("=" * 90)
+    
+    # 顯示模式
+    mode_str = "多線程平行處理" if USE_PARALLEL_PROCESSING else "單線程逐個處理"
+    print(f"🔧 處理模式: {mode_str}")
+    
+    # 顯示 baseline 儲存位置
+    print(f"📂 Baseline 檔案儲存位置:")
+    print(f"   {os.path.abspath(LOG_FOLDER)}")
+    print()
+    print(f"📋 要處理的檔案: {total} 個 Excel")
+    
+    baseline_total_size = 0
+    completed_count = 0
+    success_count = 0
+    skip_count = 0
+    error_count = 0
+    
+    # 顯示開始時間
+    start_time = time.time()
+    print(f"⏰ 開始時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print()
+    print("-" * 90)
+    
+    if USE_PARALLEL_PROCESSING:
+        # 🚀 多線程平行處理
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        
+        lock = threading.Lock()  # 保護 print 和計數器
+        max_workers = min(16, max(8, (os.cpu_count() or 1) * 2))
+        print(f"🚀 使用 {max_workers} 個 threads 進行平行處理")
+        print()
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有任務
+            future2file = {}
+            for i, file_path in enumerate(xlsx_files):
+                future = executor.submit(_baseline_worker, file_path, skip_force_baseline)
+                future2file[future] = (file_path, i+1)  # 保存原始編號
+            
+            print("📋 所有任務已提交到 thread pool，開始平行處理...")
+            print()
+            
+            # 收集結果（按完成順序）
+            for future in as_completed(future2file):
+                file_path, original_index = future2file[future]
+                
+                with lock:  # 同步 print
+                    completed_count += 1
+                    try:
+                        fname, baseline_path, size, err, start_time_str, end_time_str = future.result()
+                        _print_result(fname, baseline_path, size, err, start_time_str, end_time_str, 
+                                    completed_count, total, original_index, baseline_total_size)
+                        
+                        if err == "skip_force_baseline":
+                            skip_count += 1
+                        elif err:
+                            error_count += 1
+                        else:
+                            success_count += 1
+                            baseline_total_size += size
+                            
+                    except Exception as e:
+                        error_count += 1
+                        print(f"[完成 {completed_count:>2}/{total}] [原始#{original_index:>2}] [CRITICAL ERROR]")
+                        print(f"  檔案: {os.path.basename(file_path)}")
+                        print(f"  錯誤: {e}")
+                        print()
+    else:
+        # 🐌 單線程逐個處理
+        print("🐌 單線程逐個處理模式")
+        print()
+        
+        for i, file_path in enumerate(xlsx_files, 1):
+            try:
+                fname, baseline_path, size, err, start_time_str, end_time_str = _baseline_worker(file_path, skip_force_baseline)
+                _print_result(fname, baseline_path, size, err, start_time_str, end_time_str, 
+                            i, total, i, baseline_total_size)
+                
+                if err == "skip_force_baseline":
+                    skip_count += 1
+                elif err:
+                    error_count += 1
+                else:
+                    success_count += 1
+                    baseline_total_size += size
+                    
+            except Exception as e:
+                error_count += 1
+                print(f"[完成 {i:>2}/{total}] [原始#{i:>2}] [CRITICAL ERROR]")
+                print(f"  檔案: {os.path.basename(file_path)}")
+                print(f"  錯誤: {e}")
+                print()
+    
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    print("-" * 90)
+    print("🎯 BASELINE 建立完成!")
+    print(f"⏱️  總耗時: {total_time:.2f} 秒")
+    print(f"✅ 成功: {success_count} 個")
+    print(f"⏭️  跳過: {skip_count} 個") 
+    print(f"❌ 失敗: {error_count} 個")
+    print(f"📦 累積 baseline 檔案大小: {human_readable_size(baseline_total_size)}")
+    if success_count > 0:
+        print(f"📊 平均每檔案處理時間: {total_time/total:.2f} 秒")
+    print()
+    print(f"📁 所有 baseline 檔案存放於: {os.path.abspath(LOG_FOLDER)}")
+    print(f"   格式: [Excel檔名].baseline.json.gz")
+    print("=" * 90 + "\n")
+
+def _print_result(fname, baseline_path, size, err, start_time_str, end_time_str, 
+                 completed_count, total, original_index, baseline_total_size):
+    '''
+    統一的結果輸出格式
+    '''
+    base_name = os.path.basename(fname)
+    consumed_time = f"從 {start_time_str} 到 {end_time_str}"
+    
+    if err == "skip_force_baseline":
+        print(f"[完成 {completed_count:>2}/{total}] [原始#{original_index:>2}] [SKIP]")
+        print(f"  檔案: {base_name}")
+        print(f"  原因: 屬於 FORCE_BASELINE_ON_FIRST_SEEN，等首次 event 時建立")
+        print(f"  時間: {consumed_time}")
+        print()
+    elif err:
+        print(f"[完成 {completed_count:>2}/{total}] [原始#{original_index:>2}] [ERROR]")
+        print(f"  檔案: {base_name}")
+        print(f"  錯誤: {err}")
+        print(f"  時間: {consumed_time}")
+        print()
+    else:
+        baseline_name = os.path.basename(baseline_path)
+        new_total = baseline_total_size + size
+        print(f"[完成 {completed_count:>2}/{total}] [原始#{original_index:>2}] [OK]")
+        print(f"  檔案: {base_name}")
+        print(f"  Baseline: {baseline_name}")
+        print(f"  檔案大小: {human_readable_size(size)} | 累積: {human_readable_size(new_total)}")
+        print(f"  時間: {consumed_time}")
+        print()
+
+# =========== 其餘部分保持不變 ============
+
+class ExcelChangeHandler(FileSystemEventHandler):
+    def on_modified(self, event):
+        try:
+            if not event.is_directory and event.src_path.lower().endswith(SUPPORTED_EXTS):
+                filename = os.path.basename(event.src_path)
+                if filename.startswith('~$'):
+                    return
+                print_event(f"[{datetime.now().strftime('%H:%M:%S')}] 檔案有更動：{event.src_path}")
+
+                base_name = filename
+                baseline_file = baseline_file_path(base_name)
+
+                for attempt in range(MAX_RETRY):
+                    temp_path = None
+                    try:
+                        file_to_open = event.src_path
+                        if USE_TEMP_COPY:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(event.src_path)[1]) as tmpf:
+                                shutil.copy2(event.src_path, tmpf.name)
+                                temp_path = tmpf.name
+                            file_to_open = temp_path
+
+                        curr_author = get_excel_last_author(file_to_open)
+                        is_whitelist_user = curr_author and str(curr_author).lower() in [u.lower() for u in WHITELIST_USERS]
+
+                        force_first_baseline = is_force_baseline_file(event.src_path)
+                        baseline = load_baseline(baseline_file)
+                        prev_cells = baseline['cells'] if baseline else {}
+                        prev_hash = baseline['content_hash'] if baseline else None
+
+                        curr_cells = dump_excel_cells_with_formula(file_to_open)
+                        curr_hash = hash_excel_content(curr_cells)
+
+                        changes = compare_cells(prev_cells, curr_cells)
+
+                        if is_whitelist_user:
+                            save_baseline(baseline_file, {
+                                "last_author": curr_author,
+                                "content_hash": curr_hash,
+                                "cells": curr_cells
+                            })
+                            if LOG_WHITELIST_USER_CHANGE:
+                                log_changes_csv(CSV_LOG_FILE, event.src_path, curr_author, changes)
+                                print(f"[INFO] Whitelist user({curr_author}) overwrite baseline!")
+                                if changes:
+                                    print_cell_changes_summary(changes)
+                            break
+
+                        if curr_hash != prev_hash or force_first_baseline or (not prev_cells):
+                            if changes:
+                                print(f"  [INFO] 檢測到 cell 內容有更動！")
+                                print(f"  Last Author: {curr_author or '未知'}")
+                                print_cell_changes_summary(changes)
+                                log_changes_csv(CSV_LOG_FILE, event.src_path, curr_author, changes)
+                            else:
+                                print("  [INFO] 檔案內容有 hash 變，但未 detect cell 差異。")
+                            save_baseline(baseline_file, {
+                                "last_author": curr_author,
+                                "content_hash": curr_hash,
+                                "cells": curr_cells
+                            })
+                        else:
+                            print("  [INFO] 檔案有更動，但 cell 內容無改變。")
+                        break
+                    except PermissionError as e:
+                        print(f"  [WARN][on_modified] 檔案 lock 緊，等一等再讀... (retry {attempt+1}/{MAX_RETRY})，file: {event.src_path}，error: {e}")
+                        time.sleep(RETRY_INTERVAL_SEC)
+                    except Exception as e:
+                        print(f"[ERROR][on_modified] file: {event.src_path}，錯誤: {e}")
+                        print("建議設 USE_TEMP_COPY = True 以避免 miss event")
+                        break
+                    finally:
+                        try:
+                            if temp_path and os.path.exists(temp_path):
+                                os.remove(temp_path)
+                        except Exception as e:
+                            print(f"[DEBUG][on_modified->finally] 無法刪除 temp file {temp_path}: {e}")
+        except Exception as e:
+            print(f"[ERROR][ExcelChangeHandler.on_modified] 監控主流程 error: {e}")
+
+if __name__ == "__main__":
+    try:
+        print_console_header()
+        print("  監控資料夾:")
+        for folder in WATCH_FOLDERS:
+            print(f"    - {folder}")
+        print(f"  支援副檔名: {SUPPORTED_EXTS}")
+        print(f"  處理模式: {'多線程平行處理' if USE_PARALLEL_PROCESSING else '單線程逐個處理'}")
+        print(f"  Log/baseline 儲存位置: {os.path.abspath(LOG_FOLDER)}")
+        print(f"  Baseline 文件會存於: {os.path.abspath(LOG_FOLDER)}，每個 Excel 會有 .baseline.json.gz")
+        print(f"  變更 Log (CSV.gz): {os.path.abspath(CSV_LOG_FILE)}")
+        print(f"  Smart retry config:")
+        print(f"    MAX_RETRY = {MAX_RETRY}")
+        print(f"    RETRY_INTERVAL_SEC = {RETRY_INTERVAL_SEC}")
+        print(f"    USE_TEMP_COPY = {USE_TEMP_COPY}")
+        print(f"  Whitelist user: {WHITELIST_USERS}")
+        print(f"  LOG_WHITELIST_USER_CHANGE = {LOG_WHITELIST_USER_CHANGE}")
+        print(f"  指定首次 baseline file: {FORCE_BASELINE_ON_FIRST_SEEN}")
+        os.makedirs(LOG_FOLDER, exist_ok=True)
+
+        if SCAN_ALL_MODE:
+            all_files = get_all_excel_files(WATCH_FOLDERS)
+            print(f"總共 find 到 {len(all_files)} 個 Excel file.")
+            create_baseline_for_files(all_files, skip_force_baseline=True)
+            print("baseline scan 完成！\n")
+        else:
+            target_files = get_all_excel_files(MANUAL_BASELINE_TARGET)
+            print(f"手動指定 baseline，合共 {len(target_files)} 個 Excel file.")
+            create_baseline_for_files(target_files, skip_force_baseline=False)
+            print("手動 baseline 完成！\n")
+
+        event_handler = ExcelChangeHandler()
+        observer = Observer()
+        for folder in WATCH_FOLDERS:
+            observer.schedule(event_handler, folder, recursive=True)
+        print("\n[INFO] 開始監控...\n")
+        try:
+            observer.start()
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            observer.stop()
+            print("\n  [INFO] 停止監控，程式結束。")
+        observer.join()
+    except Exception as e:
+        print(f"[ERROR][main] 程式主流程 error: {e}")
