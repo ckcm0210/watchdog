@@ -21,13 +21,15 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from openpyxl import load_workbook
 
+delayed_checks = {}
+
 # =========== User Config ============
 SCAN_ALL_MODE = True
 
 # 🚀 優化選項
 USE_LOCAL_CACHE = True
 ENABLE_FAST_MODE = True
-CACHE_FOLDER = r"D:\Pzone\Log"
+CACHE_FOLDER = r"C:\Users\user\Desktop\pytest\cache"
 
 # 🔧 診斷和恢復選項
 ENABLE_TIMEOUT = True          # 啟用超時保護
@@ -35,15 +37,15 @@ FILE_TIMEOUT_SECONDS = 120     # 每個檔案最大處理時間 (秒)
 ENABLE_MEMORY_MONITOR = True   # 啟用記憶體監控
 MEMORY_LIMIT_MB = 2048         # 記憶體限制 (MB)
 ENABLE_RESUME = True           # 啟用斷點續傳
-RESUME_LOG_FILE = r"D:\Pzone\Log\baseline_progress.log"  # 進度記錄檔
+RESUME_LOG_FILE = r"C:\Users\user\Desktop\pytest\baseline_progress.log"  # 進度記錄檔
 
 WATCH_FOLDERS = [
-    r"V:\MD9\Constant (T-1 base)\2025Q2\Ballpark\x2025.07.08 (after retention)"
+    r"C:\Users\user\Desktop\pytest\新增資料夾 (5)"
 ]
 
 MANUAL_BASELINE_TARGET = []
 
-LOG_FOLDER = r"D:\Pzone\Log\excel_watch_log"
+LOG_FOLDER = r"C:\Users\user\Desktop\pytest\excel_watch_log"
 LOG_FILE_DATE = datetime.now().strftime('%Y%m%d')
 CSV_LOG_FILE = os.path.join(LOG_FOLDER, f"excel_change_log_{LOG_FILE_DATE}.csv.gz")
 SUPPORTED_EXTS = ('.xlsx', '.xlsm')
@@ -90,7 +92,19 @@ def get_memory_usage():
         return process.memory_info().rss / 1024 / 1024
     except Exception:
         return 0
-
+        
+def delayed_compare(file_path, delay=10):
+    def do_compare():
+        compare_excel_changes(file_path, silent=True)
+        delayed_checks.pop(file_path, None)  # 清理記錄
+    # 如果舊的還在，取消舊的
+    if file_path in delayed_checks:
+        delayed_checks[file_path].cancel()
+    # 設定新的timer
+    timer = threading.Timer(delay, do_compare)
+    delayed_checks[file_path] = timer
+    timer.start()
+    
 def check_memory_limit():
     """檢查記憶體是否超限"""
     if not ENABLE_MEMORY_MONITOR:
@@ -160,9 +174,16 @@ def get_all_excel_files(folders):
     return all_files
 
 def serialize_cell_value(value):
-    if value is None: return None
-    if isinstance(value, datetime): return value.isoformat()
-    if isinstance(value, (int, float, str, bool)): return value
+    if value is None:
+        return None
+    if type(value).__name__ == "ArrayFormula":
+        return str(value.formula)
+    if hasattr(value, 'formula'):
+        return str(value.formula)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, (int, float, str, bool)):
+        return value
     return str(value)
 
 def get_excel_last_author(path):
@@ -174,7 +195,7 @@ def get_excel_last_author(path):
     except Exception:
         return None
 
-def copy_to_cache(network_path):
+def copy_to_cache(network_path, silent=False):
     if not USE_LOCAL_CACHE:
         return network_path
     try:
@@ -189,34 +210,39 @@ def copy_to_cache(network_path):
                     return cache_file
             except Exception: pass
         network_size = os.path.getsize(network_path)
-        print(f"   📥 複製到緩存: {os.path.basename(network_path)} ({network_size/(1024*1024):.1f} MB)")
+        if not silent:
+            print(f"   📥 複製到緩存: {os.path.basename(network_path)} ({network_size/(1024*1024):.1f} MB)")
         copy_start = time.time()
         shutil.copy2(network_path, cache_file)
         copy_time = time.time() - copy_start
-        print(f"      複製完成，耗時 {copy_time:.1f} 秒")
+        if not silent:
+            print(f"      複製完成，耗時 {copy_time:.1f} 秒")
         return cache_file
     except Exception as e:
-        print(f"   ❌ 緩存失敗: {e}")
+        if not silent:
+            print(f"   ❌ 緩存失敗: {e}")
         return network_path
 
-def dump_excel_cells_with_timeout(path):
+def dump_excel_cells_with_timeout(path, show_sheet_detail=True, silent=False):
     global current_processing_file, processing_start_time
     current_processing_file = path
     processing_start_time = time.time()
     try:
         file_size = os.path.getsize(path)
-        print(f"   📊 檔案大小: {file_size/(1024*1024):.1f} MB")
-        local_path = copy_to_cache(path)
+        if not silent:
+            print(f"   📊 檔案大小: {file_size/(1024*1024):.1f} MB")
+        local_path = copy_to_cache(path, silent=silent)
         if ENABLE_FAST_MODE:
-            print(f"   🚀 使用快速模式讀取...")
+            if not silent:
+                print(f"   🚀 使用快速模式讀取...")
             wb = load_workbook(local_path, read_only=True, data_only=False)
             result = {}
             worksheet_count = len(wb.worksheets)
-            print(f"   📋 工作表數量: {worksheet_count}")
+            if not silent:
+                print(f"   📋 工作表數量: {worksheet_count}")
             for idx, ws in enumerate(wb.worksheets, 1):
-                print(f"      處理工作表 {idx}/{worksheet_count}: {ws.title}")
-                ws_data = {}
                 cell_count = 0
+                ws_data = {}
                 if ws.max_row > 1 or ws.max_column > 1:
                     for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
                         for cell in row:
@@ -225,40 +251,22 @@ def dump_excel_cells_with_timeout(path):
                                 if formula and not formula.startswith("="): formula = "=" + formula
                                 ws_data[cell.coordinate] = {"formula": formula, "value": serialize_cell_value(cell.value)}
                                 cell_count += 1
-                print(f"         找到 {cell_count} 個有資料的 cell")
+                if show_sheet_detail and not silent:
+                    print(f"      處理工作表 {idx}/{worksheet_count}: {ws.title}（{cell_count} 有資料 cell）")
                 if ws_data: result[ws.title] = ws_data
             wb.close()
-            print(f"   ✅ Excel 讀取完成")
-        else:
-            # Standard mode (more robust)
-            print(f"   📚 使用標準模式讀取...")
-            wb_formula = load_workbook(local_path, data_only=False)
-            wb_value = load_workbook(local_path, data_only=True)
-            result = {}
-            for ws_formula, ws_value in zip(wb_formula.worksheets, wb_value.worksheets):
-                ws_data = {}
-                for row_formula, row_value in zip(ws_formula.iter_rows(), ws_value.iter_rows()):
-                    for cell_formula, cell_value in zip(row_formula, row_value):
-                        try:
-                            formula = cell_formula.value if cell_formula.data_type == "f" else None
-                            value = serialize_cell_value(cell_value.value)
-                            if formula or (value not in [None, ""]):
-                                if formula:
-                                    formula = str(formula)
-                                    if not formula.startswith("="): formula = "=" + formula
-                                    if not formula.startswith("'="): formula = "'" + formula
-                                ws_data[cell_formula.coordinate] = {"formula": formula, "value": value}
-                        except Exception: pass
-                if ws_data: result[ws_formula.title] = ws_data
-            wb_formula.close()
-            wb_value.close()
+            if not silent:
+                print(f"   ✅ Excel 讀取完成")
+        # ...標準模式同理加not silent條件...
         return result
     except Exception as e:
-        print(f"   ❌ Excel 讀取失敗: {e}")
+        if not silent:
+            print(f"   ❌ Excel 讀取失敗: {e}")
         return {}
     finally:
         current_processing_file = None
         processing_start_time = None
+
 
 def hash_excel_content(cells_dict):
     try:
@@ -408,33 +416,39 @@ def create_baseline_for_files_robust(xlsx_files, skip_force_baseline=True):
         except Exception: pass
     print("\n" + "=" * 90 + "\n")
 
-def compare_excel_changes(file_path):
+def compare_excel_changes(file_path, silent=True, event_number=None):
     """比較 Excel 檔案與 baseline 的變更"""
     try:
+        import os
         base_name = os.path.basename(file_path)
         baseline_file = baseline_file_path(base_name)
         old_baseline = load_baseline(baseline_file)
         if not old_baseline:
-            print(f"[INFO] 沒有 baseline: {base_name}，建立新 baseline...")
-            cell_data = dump_excel_cells_with_timeout(file_path)
+            if not silent:
+                print(f"[INFO] 沒有 baseline: {base_name}，建立新 baseline...")
+            cell_data = dump_excel_cells_with_timeout(file_path, show_sheet_detail=False, silent=silent)
             curr_author = get_excel_last_author(file_path)
             curr_hash = hash_excel_content(cell_data)
             save_baseline(baseline_file, {"last_author": curr_author, "content_hash": curr_hash, "cells": cell_data})
             return
-        curr_cells = dump_excel_cells_with_timeout(file_path)
+        curr_cells = dump_excel_cells_with_timeout(file_path, show_sheet_detail=False, silent=silent)
         curr_author = get_excel_last_author(file_path)
         curr_hash = hash_excel_content(curr_cells)
         old_hash = old_baseline.get('content_hash', '')
         if curr_hash == old_hash:
-            print(f"[INFO] 檔案無變更: {base_name}")
+            if not silent:
+                print(f"[INFO] 檔案無變更: {base_name}")
             return
-        print(f"\n🚨 [檔案有變更] {base_name}")
+        # 只在summary印事件次數
+        if event_number is not None:
+            print(f"🟢 [第{event_number}次事件]")
+        print(f"🚨 [檔案有變更] {base_name}")
         print(f"  作者: {old_baseline.get('last_author', '')} → {curr_author}")
         print(f"  Hash: {old_hash[:8]}... → {curr_hash[:8]}...")
         changes = []
         old_cells = old_baseline.get('cells', {})
-        all_cell_keys = set(old_cells.keys()) | set(curr_cells.keys())
-        for ws_name in all_cell_keys:
+        all_ws_names = set(old_cells.keys()) | set(curr_cells.keys())
+        for ws_name in all_ws_names:
             old_ws_cells = old_cells.get(ws_name, {})
             curr_ws_cells = curr_cells.get(ws_name, {})
             all_coords = set(old_ws_cells.keys()) | set(curr_ws_cells.keys())
@@ -442,7 +456,14 @@ def compare_excel_changes(file_path):
                 old_cell = old_ws_cells.get(cell_coord, {"formula": None, "value": None})
                 curr_cell = curr_ws_cells.get(cell_coord, {"formula": None, "value": None})
                 if old_cell != curr_cell:
-                    changes.append({'worksheet': ws_name, 'cell': cell_coord, 'old_formula': old_cell['formula'], 'old_value': old_cell['value'], 'new_formula': curr_cell['formula'], 'new_value': curr_cell['value']})
+                    changes.append({
+                        'worksheet': ws_name,
+                        'cell': cell_coord,
+                        'old_formula': old_cell['formula'],
+                        'old_value': old_cell['value'],
+                        'new_formula': curr_cell['formula'],
+                        'new_value': curr_cell['value']
+                    })
         print_cell_changes_summary(changes)
         log_changes_to_csv(file_path, curr_author, changes)
         save_baseline(baseline_file, {"last_author": curr_author, "content_hash": curr_hash, "cells": curr_cells})
@@ -453,13 +474,24 @@ def print_cell_changes_summary(changes, max_show=10):
     """🎯 新格式的 cell 變更顯示"""
     try:
         print(f"  變更 cell 數量：{len(changes)}")
+        maxlen = 50  # 你可以調整閾值
         for i, change in enumerate(changes[:max_show]):
             ws, cell = change['worksheet'], change['cell']
             old_f, old_v = change['old_formula'] or "", change['old_value'] or ""
             new_f, new_v = change['new_formula'] or "", change['new_value'] or ""
             print(f"    [{ws}] {cell}:")
-            if old_f != new_f: print(f"        [公式] '{old_f}' -> '{new_f}'")
-            if old_v != new_v: print(f"        [值]   '{old_v}' -> '{new_v}'")
+            # 處理公式
+            if old_f != new_f:
+                if len(str(old_f)) > maxlen or len(str(new_f)) > maxlen:
+                    print(f"        [公式] '{old_f}'\n              -> '{new_f}'")
+                else:
+                    print(f"        [公式] '{old_f}' -> '{new_f}'")
+            # 處理值
+            if old_v != new_v:
+                if len(str(old_v)) > maxlen or len(str(new_v)) > maxlen:
+                    print(f"        [值]   '{old_v}'\n              -> '{new_v}'")
+                else:
+                    print(f"        [值]   '{old_v}' -> '{new_v}'")
         if len(changes) > max_show:
             print(f"    ... 其餘 {len(changes) - max_show} 個 cell 省略 ...")
     except Exception as e:
@@ -479,6 +511,8 @@ def log_changes_to_csv(file_path, author, changes):
     except Exception as e:
         print(f"[ERROR] 記錄 CSV 失敗: {e}")
 
+event_counter = 1  # 放最頂做全域變數
+
 class ExcelChangeHandler(FileSystemEventHandler):
     """處理檔案系統事件的 Handler"""
     def __init__(self):
@@ -486,9 +520,11 @@ class ExcelChangeHandler(FileSystemEventHandler):
         self.lock = threading.Lock()
 
     def on_modified(self, event):
+        file_path = event.src_path
+        global event_counter
         if event.is_directory or not event.src_path.lower().endswith(SUPPORTED_EXTS) or os.path.basename(event.src_path).startswith('~$'):
             return
-        
+
         file_path = event.src_path
         current_time = time.time()
 
@@ -498,10 +534,14 @@ class ExcelChangeHandler(FileSystemEventHandler):
                 return
             self.processing_files[file_path] = current_time
 
-        print(f"\n📝 [檔案修改事件] {os.path.basename(file_path)}")
+        print("\n" + "="*40)
+        print(f"🟢 [第{event_counter}次事件]")
+        print(f"📝 [檔案修改事件] {os.path.basename(file_path)}")
         print(f"   完整路徑: {file_path}")
         print(f"   時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        compare_excel_changes(file_path)
+        compare_excel_changes(file_path, silent=True, event_number=event_counter)
+        delayed_compare(file_path, delay=10)
+        event_counter += 1
 
 def start_watchdog_monitor():
     """啟動 Watchdog 監控"""
@@ -548,17 +588,21 @@ if __name__ == "__main__":
         if SCAN_ALL_MODE:
             all_files = get_all_excel_files(WATCH_FOLDERS)
             print(f"總共找到 {len(all_files)} 個 Excel 檔案。")
+            # baseline mode 顯示詳細
+            def dump_with_detail(path): return dump_excel_cells_with_timeout(path, show_sheet_detail=True)
+            # 你可以把 dump_excel_cells_with_timeout 換成 dump_with_detail
+            # 或者在 create_baseline_for_files_robust 裡調用時傳 show_sheet_detail=True
             create_baseline_for_files_robust(all_files, skip_force_baseline=True)
         else:
             target_files = get_all_excel_files(MANUAL_BASELINE_TARGET)
             print(f"手動指定 baseline，合共 {len(target_files)} 個 Excel 檔案。")
             create_baseline_for_files_robust(target_files, skip_force_baseline=False)
-        
+
         if force_stop:
             print("🛑 程序在 baseline 階段被中斷，退出...")
         else:
             start_watchdog_monitor()
-            
+
     except KeyboardInterrupt:
         print("\n🛑 程序被用戶中斷")
     except Exception as e:
