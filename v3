@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Excel 檔案異動監控主程式
-作者: kccheng
-2025-07-10
+Created on Thu Jul 10 16:29:38 2025
+
+@author: kccheng
 """
 
 import os
@@ -21,58 +21,132 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from openpyxl import load_workbook
 
-# ===================== 1. 使用者設定區（User Config） =====================
+delayed_checks = {}
+
+# =========== User Config ============
+# 【本區所有設定皆可根據實際工作環境與需求調整，請詳閱每項說明】
 
 SCAN_ALL_MODE = True
+# 【自動批量掃描模式】
+# True：啟動程式時會自動遞迴掃描 WATCH_FOLDERS 內所有 Excel 檔案，自動建立 baseline（基準快照）。
+# False：只會針對 MANUAL_BASELINE_TARGET 清單指定的檔案建立 baseline。適合只要監控特定檔案的情境。
 
 USE_LOCAL_CACHE = True
-ENABLE_FAST_MODE = True
+# 【啟用本地緩存】
+# True：每次分析/比對 Excel 時，會先自動將檔案複製一份到本機 CACHE_FOLDER，再在本地進行所有讀取及分析動作。
+# 這樣做的好處：
+#   - 大幅減少網絡磁碟、雲端、USB 等來源的讀取延遲與檔案鎖定問題。
+#   - 可提升分析速度及成功率（特別是多user同時打開檔案時）。
+# 關閉時（False）：
+#   - 直接以原始路徑讀檔，若為本地硬碟/SSD檔案可考慮關閉，但遇到網絡/雲端環境時，建議開啟。
+
 CACHE_FOLDER = r"C:\Users\user\Desktop\pytest\cache"
+# 【本地緩存資料夾路徑】
+# 當 USE_LOCAL_CACHE=True 時，所有待分析的 Excel 檔案都會先複製到這個資料夾再進行比對。
+# 注意事項：
+#   - 原始檔案不會被更改，所有比對和讀取都在 cache 副本進行。
+#   - 請設於磁碟空間充足、寫入速度快的位置。
+#   - 清理時可直接刪除此資料夾內容，無風險。
+#   - 不建議設於雲端/同步資料夾，否則反而拖慢速度。
+
+ENABLE_FAST_MODE = True
+# 【啟用 openpyxl 快速讀取模式】
+# True：會用 openpyxl 的 read_only + data_only 方式快速讀取 Excel，大部份情況下速度更快。
+# False：遇到特殊格式、巨集或加密 Excel 若有讀取錯誤，可關閉此功能。
 
 ENABLE_TIMEOUT = True
+# 【啟用單檔案處理超時保護】
+# True：每個 Excel 檔案讀取/分析超過 FILE_TIMEOUT_SECONDS 秒會自動中斷跳過，防止大檔案或損毀檔案導致卡死。
+# 建議生產環境啟用。
+
 FILE_TIMEOUT_SECONDS = 120
+# 【單一檔案最大處理秒數】
+# 配合 ENABLE_TIMEOUT 使用。每個 Excel 檔案分析最多允許的秒數，超過就自動跳過。
+
 ENABLE_MEMORY_MONITOR = True
+# 【啟用記憶體監控】
+# True：每隔一段時間檢查 process 記憶體使用量，若超過 MEMORY_LIMIT_MB 會自動執行垃圾回收（gc.collect）。
+# 對於需要長時運行的情境建議啟用。
+
 MEMORY_LIMIT_MB = 2048
+# 【記憶體最大限制 (MB)】
+# 超過此數值時會觸發記憶體回收，仍無法回復則暫停/跳過檔案，防止爆 RAM。
+
 ENABLE_RESUME = True
+# 【啟用 baseline 建立斷點續傳】
+# True：若批量建立 baseline 過程因中斷（如 crash），可下次自動從上次已完成進度繼續，節省時間。
+
 RESUME_LOG_FILE = r"C:\Users\user\Desktop\pytest\baseline_progress.log"
+# 【baseline 進度記錄檔】
+# 只有 ENABLE_RESUME=True 時會用。自動記錄已完成 baseline 檔案數與總數。
 
 WATCH_FOLDERS = [
     r"C:\Users\user\Desktop\pytest\新增資料夾 (5)"
 ]
+# 【監控目錄清單】
+# 設定要實時監控 Excel 檔案變更的資料夾（可多個，支援子目錄遞迴）。
+# 所有支援副檔名的 Excel 檔案都會被自動監控。
 
 MANUAL_BASELINE_TARGET = []
+# 【手動 baseline 檔案清單】
+# 只有 SCAN_ALL_MODE=False 時才會用。指定要建立 baseline 的 Excel 檔案清單（完整路徑）。
+# 適合只要監控個別檔案、不需全資料夾掃描時用。
 
 LOG_FOLDER = r"C:\Users\user\Desktop\pytest\excel_watch_log"
+# 【Log 檔案儲存資料夾】
+# 變更摘要、baseline、錯誤等所有日誌都會寫入這個資料夾。
+
 LOG_FILE_DATE = datetime.now().strftime('%Y%m%d')
+# 【Log 檔案日期字串】
+# 自動加到 CSV_LOG_FILE 名稱內，方便每日分開管理 log。
+
 CSV_LOG_FILE = os.path.join(LOG_FOLDER, f"excel_change_log_{LOG_FILE_DATE}.csv.gz")
+# 【變更記錄 CSV 壓縮檔路徑】
+# 每次有 Excel 變更事件時，詳細比對結果都會寫入這個 CSV(.gz)壓縮檔，可用 Excel/Notepad++/7-Zip 開啟。
+
 SUPPORTED_EXTS = ('.xlsx', '.xlsm')
+# 【支援監控的 Excel 副檔名】
+# 只會監控這些副檔名的 Excel 檔案（.xls不支援）。
 
 MAX_RETRY = 10
-RETRY_INTERVAL_SEC = 2
-USE_TEMP_COPY = True
+# 【檔案讀取最大重試次數】
+# 當檔案被鎖、臨時無法讀取時，最多會重試這麼多次（每次間隔 RETRY_INTERVAL_SEC 秒）。
 
-# ====== 用戶衝突處理相關設定（User Conflict Related）======
+RETRY_INTERVAL_SEC = 2
+# 【重試間隔秒數】
+# 每次重試讀檔失敗之間會等待的秒數。
+
+USE_TEMP_COPY = True
+# 【是否優先用臨時檔案複製再讀取】
+# True：讀取/分析 Excel 前會先複製一份臨時檔案，避免原始檔案被 Excel/用戶鎖定導致讀取錯誤。
+# False：直接對原始路徑操作，可能會因檔案正被使用而失敗。
+
+# ====== 用戶衝突處理/白名單選項 ======
 WHITELIST_USERS = ['ckcm0210', 'yourwhiteuser']
-# 只允許這些user的變更會被記錄，其他user編輯會被忽略（可於log中顯示但不比對）
+# 【允許的用戶名單（白名單）】
+# 只有這些 Windows/Excel 使用者的操作會被記錄為正式變更。
+# 其他用戶修改時，可選擇只寫 log 不進行 baseline/比對（視 LOG_WHITELIST_USER_CHANGE 設定）。
+
 LOG_WHITELIST_USER_CHANGE = True
-# 是否對白名單外user的行為進行log記錄
+# 【是否記錄白名單外用戶的變更】
+# True：白名單外的用戶修改 Excel 也會記錄在 log（但可不進行 baseline/比對）。
+# False：完全忽略非白名單用戶的修改。
 
 FORCE_BASELINE_ON_FIRST_SEEN = [
     r"\\network_drive\\your_folder1\\must_first_baseline.xlsx",
     "force_this_file.xlsx"
 ]
-# 這些檔案第一次遇到時一定要建立 baseline，即使其他選項不啟用
+# 【強制 baseline 檔案名單】
+# 無論其他條件，這裡列出的 Excel 檔案只要第一次見到就必定建立 baseline（即使不在監控資料夾）。
+# 適合重要檔案、特殊需求時使用。
 
-# ===================== 2. 全域變數區（Global Variables） =====================
+# =========== End User Config ============
 
-event_counter = 1  # 事件次數計數器
-delayed_checks = {}  # 用於延遲二次比對的記錄
+# 全局變數
 current_processing_file = None
 processing_start_time = None
 force_stop = False
 baseline_completed = False
-
-# ===================== 3. 工具/共用功能函式（Utility Functions） =====================
 
 def signal_handler(signum, frame):
     """處理 Ctrl+C 中斷"""
@@ -91,13 +165,25 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 def get_memory_usage():
-    """獲取目前記憶體使用量（MB）"""
+    """獲取目前記憶體使用量"""
     try:
         process = psutil.Process(os.getpid())
         return process.memory_info().rss / 1024 / 1024
     except Exception:
         return 0
-
+        
+def delayed_compare(file_path, delay=10):
+    def do_compare():
+        compare_excel_changes(file_path, silent=True)
+        delayed_checks.pop(file_path, None)  # 清理記錄
+    # 如果舊的還在，取消舊的
+    if file_path in delayed_checks:
+        delayed_checks[file_path].cancel()
+    # 設定新的timer
+    timer = threading.Timer(delay, do_compare)
+    delayed_checks[file_path] = timer
+    timer.start()
+    
 def check_memory_limit():
     """檢查記憶體是否超限"""
     if not ENABLE_MEMORY_MONITOR:
@@ -112,19 +198,8 @@ def check_memory_limit():
         return new_memory > MEMORY_LIMIT_MB
     return False
 
-def delayed_compare(file_path, delay=10):
-    """延遲執行比對，用於捕捉短時間內多重修改的情況"""
-    def do_compare():
-        compare_excel_changes(file_path, silent=True)
-        delayed_checks.pop(file_path, None)
-    if file_path in delayed_checks:
-        delayed_checks[file_path].cancel()
-    timer = threading.Timer(delay, do_compare)
-    delayed_checks[file_path] = timer
-    timer.start()
-
 def save_progress(completed_files, total_files):
-    """儲存 baseline 建立進度"""
+    """儲存進度到檔案"""
     if not ENABLE_RESUME:
         return
     try:
@@ -139,7 +214,7 @@ def save_progress(completed_files, total_files):
         print(f"[WARN] 無法儲存進度: {e}")
 
 def load_progress():
-    """載入 baseline 建立進度"""
+    """載入之前的進度"""
     if not ENABLE_RESUME or not os.path.exists(RESUME_LOG_FILE):
         return None
     try:
@@ -150,7 +225,7 @@ def load_progress():
         return None
 
 def timeout_handler():
-    """baseline建立階段的超時處理執行緒"""
+    """超時處理函數 (只在 baseline 階段運行)"""
     global current_processing_file, processing_start_time, force_stop, baseline_completed
     while not force_stop and not baseline_completed:
         time.sleep(10)
@@ -164,19 +239,7 @@ def timeout_handler():
                 current_processing_file = None
                 processing_start_time = None
 
-def human_readable_size(num_bytes):
-    """友善格式化檔案大小"""
-    if num_bytes is None: return "0 B"
-    for unit in ['B','KB','MB','GB','TB']:
-        if num_bytes < 1024.0:
-            return f"{num_bytes:,.2f} {unit}"
-        num_bytes /= 1024.0
-    return f"{num_bytes:.2f} PB"
-
-# ===================== 4. Excel/檔案操作相關函式 =====================
-
 def get_all_excel_files(folders):
-    """遞迴取得所有 Excel 檔案清單"""
     all_files = []
     for folder in folders:
         if os.path.isfile(folder):
@@ -190,11 +253,11 @@ def get_all_excel_files(folders):
     return all_files
 
 def serialize_cell_value(value):
-    """將 cell value 轉為可 json 化的格式（避免 openpyxl 物件地址變動）"""
     if value is None:
         return None
     if type(value).__name__ == "ArrayFormula":
-        return str(value.formula)
+        # 用 text 屬性如有，否則用 repr
+        return getattr(value, 'text', repr(value))
     if hasattr(value, 'formula'):
         return str(value.formula)
     if isinstance(value, datetime):
@@ -202,9 +265,8 @@ def serialize_cell_value(value):
     if isinstance(value, (int, float, str, bool)):
         return value
     return str(value)
-
+    
 def get_excel_last_author(path):
-    """取得 Excel 檔案最後修改者（lastModifiedBy）"""
     try:
         wb = load_workbook(path, read_only=True)
         author = wb.properties.lastModifiedBy
@@ -214,7 +276,6 @@ def get_excel_last_author(path):
         return None
 
 def copy_to_cache(network_path, silent=False):
-    """如果啟用本地緩存，將檔案複製到本地 cache 資料夾後再讀取"""
     if not USE_LOCAL_CACHE:
         return network_path
     try:
@@ -243,11 +304,6 @@ def copy_to_cache(network_path, silent=False):
         return network_path
 
 def dump_excel_cells_with_timeout(path, show_sheet_detail=True, silent=False):
-    """
-    讀取 Excel 所有 worksheet+cell 的 value/formula
-    - 會用本地緩存
-    - 若啟用快速模式，會用較快的 openpyxl 讀取
-    """
     global current_processing_file, processing_start_time
     current_processing_file = path
     processing_start_time = time.time()
@@ -256,10 +312,50 @@ def dump_excel_cells_with_timeout(path, show_sheet_detail=True, silent=False):
         if not silent:
             print(f"   📊 檔案大小: {file_size/(1024*1024):.1f} MB")
         local_path = copy_to_cache(path, silent=silent)
+
+        # === 新增：Fast Mode fallback 機制 ===
+        tried_fast_mode = False
+        result = None
+        fast_mode_error = None
+
         if ENABLE_FAST_MODE:
+            try:
+                if not silent:
+                    print(f"   🚀 使用快速模式讀取...")
+                wb = load_workbook(local_path, read_only=True, data_only=False)
+                result = {}
+                worksheet_count = len(wb.worksheets)
+                if not silent:
+                    print(f"   📋 工作表數量: {worksheet_count}")
+                for idx, ws in enumerate(wb.worksheets, 1):
+                    cell_count = 0
+                    ws_data = {}
+                    if ws.max_row > 1 or ws.max_column > 1:
+                        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                            for cell in row:
+                                if cell.value is not None:
+                                    formula = str(cell.value) if cell.data_type == "f" else None
+                                    if formula and not formula.startswith("="): formula = "=" + formula
+                                    ws_data[cell.coordinate] = {"formula": formula, "value": serialize_cell_value(cell.value)}
+                                    cell_count += 1
+                    if show_sheet_detail and not silent:
+                        print(f"      處理工作表 {idx}/{worksheet_count}: {ws.title}（{cell_count} 有資料 cell）")
+                    if ws_data: result[ws.title] = ws_data
+                wb.close()
+                if not silent:
+                    print(f"   ✅ Excel 讀取完成")
+                return result
+            except Exception as e:
+                fast_mode_error = e
+                if not silent:
+                    print(f"   ⚠️ 快速模式讀取失敗，將自動切換普通模式重試（錯誤：{e}）")
+                tried_fast_mode = True
+
+        # === fallback 普通模式 ===
+        try:
             if not silent:
-                print(f"   🚀 使用快速模式讀取...")
-            wb = load_workbook(local_path, read_only=True, data_only=False)
+                print("   🐢 使用普通模式讀取...")
+            wb = load_workbook(local_path, read_only=False, data_only=False)
             result = {}
             worksheet_count = len(wb.worksheets)
             if not silent:
@@ -280,19 +376,22 @@ def dump_excel_cells_with_timeout(path, show_sheet_detail=True, silent=False):
                 if ws_data: result[ws.title] = ws_data
             wb.close()
             if not silent:
-                print(f"   ✅ Excel 讀取完成")
-        # ...標準模式同理加not silent條件...
-        return result
-    except Exception as e:
-        if not silent:
-            print(f"   ❌ Excel 讀取失敗: {e}")
-        return {}
+                print(f"   ✅ Excel 讀取完成（普通模式）")
+            return result
+        except Exception as e:
+            if tried_fast_mode:
+                if not silent:
+                    print(f"   ❌ 快速模式和普通模式都失敗！快速模式錯誤：{fast_mode_error}，普通模式錯誤：{e}")
+            else:
+                if not silent:
+                    print(f"   ❌ Excel 讀取失敗: {e}")
+            return {}
     finally:
         current_processing_file = None
         processing_start_time = None
 
+
 def hash_excel_content(cells_dict):
-    """將 Excel 所有 cell 資料做 hash，方便快速比對是否有變更"""
     try:
         content_str = json.dumps(cells_dict, sort_keys=True, ensure_ascii=False)
         return hashlib.md5(content_str.encode('utf-8')).hexdigest()
@@ -300,11 +399,9 @@ def hash_excel_content(cells_dict):
         return None
 
 def baseline_file_path(base_name):
-    """依據檔名產生 baseline 檔案路徑"""
     return os.path.join(LOG_FOLDER, f"{base_name}.baseline.json.gz")
 
 def load_baseline(baseline_file):
-    """載入 baseline json.gz 檔案"""
     try:
         if os.path.exists(baseline_file):
             with gzip.open(baseline_file, 'rt', encoding='utf-8') as f:
@@ -315,7 +412,6 @@ def load_baseline(baseline_file):
         return None
 
 def save_baseline(baseline_file, data):
-    """儲存 baseline json.gz 檔案"""
     try:
         with gzip.open(baseline_file, 'wt', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, separators=(',', ':'))
@@ -323,7 +419,6 @@ def save_baseline(baseline_file, data):
         print(f"[ERROR][save_baseline] error saving {baseline_file}: {e}")
 
 def is_force_baseline_file(filepath):
-    """判斷是否屬於強制 baseline 檔案名單"""
     try:
         lowerfile = filepath.lower()
         for pattern in FORCE_BASELINE_ON_FIRST_SEEN:
@@ -333,13 +428,16 @@ def is_force_baseline_file(filepath):
     except Exception:
         return False
 
-# ===================== 5. Baseline 建立 & 變更比對主流程 =====================
+def human_readable_size(num_bytes):
+    if num_bytes is None: return "0 B"
+    for unit in ['B','KB','MB','GB','TB']:
+        if num_bytes < 1024.0:
+            return f"{num_bytes:,.2f} {unit}"
+        num_bytes /= 1024.0
+    return f"{num_bytes:.2f} PB"
 
 def create_baseline_for_files_robust(xlsx_files, skip_force_baseline=True):
-    """
-    強化 baseline 建立流程（支援 resume、hash smart skip、記憶體/超時保護）
-    - baseline 會同步寫入 last_author、hash、所有 cell value
-    """
+    """🛡️ 強化版 baseline 建立，帶診斷和恢復功能 + hash unchanged smart skip"""
     global force_stop, baseline_completed
     total = len(xlsx_files)
     if total == 0:
@@ -442,11 +540,7 @@ def create_baseline_for_files_robust(xlsx_files, skip_force_baseline=True):
     print("\n" + "=" * 90 + "\n")
 
 def compare_excel_changes(file_path, silent=True, event_number=None):
-    """
-    比較 Excel 檔案與 baseline 的變更
-    - 若 baseline 不存在會自動建立 baseline
-    - 如有變更會印出 summary 並寫 log
-    """
+    """比較 Excel 檔案與 baseline 的變更"""
     try:
         import os
         base_name = os.path.basename(file_path)
@@ -468,6 +562,7 @@ def compare_excel_changes(file_path, silent=True, event_number=None):
             if not silent:
                 print(f"[INFO] 檔案無變更: {base_name}")
             return
+        # 只在summary印事件次數
         if event_number is not None:
             print(f"🟢 [第{event_number}次事件]")
         print(f"🚨 [檔案有變更] {base_name}")
@@ -499,25 +594,22 @@ def compare_excel_changes(file_path, silent=True, event_number=None):
         print(f"[ERROR] 比較檔案失敗: {file_path} - {e}")
 
 def print_cell_changes_summary(changes, max_show=10):
-    """
-    格式化印出 cell 變更 summary
-    - 長內容會自動換行
-    """
+    """🎯 新格式的 cell 變更顯示"""
     try:
         print(f"  變更 cell 數量：{len(changes)}")
-        maxlen = 50
+        maxlen = 50  # 你可以調整閾值
         for i, change in enumerate(changes[:max_show]):
             ws, cell = change['worksheet'], change['cell']
             old_f, old_v = change['old_formula'] or "", change['old_value'] or ""
             new_f, new_v = change['new_formula'] or "", change['new_value'] or ""
             print(f"    [{ws}] {cell}:")
-            # 公式
+            # 處理公式
             if old_f != new_f:
                 if len(str(old_f)) > maxlen or len(str(new_f)) > maxlen:
                     print(f"        [公式] '{old_f}'\n              -> '{new_f}'")
                 else:
                     print(f"        [公式] '{old_f}' -> '{new_f}'")
-            # 值
+            # 處理值
             if old_v != new_v:
                 if len(str(old_v)) > maxlen or len(str(new_v)) > maxlen:
                     print(f"        [值]   '{old_v}'\n              -> '{new_v}'")
@@ -529,7 +621,7 @@ def print_cell_changes_summary(changes, max_show=10):
         print(f"[ERROR][print_cell_changes_summary] {e}")
 
 def log_changes_to_csv(file_path, author, changes):
-    """將變更寫入壓縮 CSV log"""
+    """記錄變更到 CSV"""
     try:
         os.makedirs(LOG_FOLDER, exist_ok=True)
         is_new_file = not os.path.exists(CSV_LOG_FILE)
@@ -542,14 +634,10 @@ def log_changes_to_csv(file_path, author, changes):
     except Exception as e:
         print(f"[ERROR] 記錄 CSV 失敗: {e}")
 
-# ===================== 6. Watchdog Handler & 監控 =====================
+event_counter = 1  # 放最頂做全域變數
 
 class ExcelChangeHandler(FileSystemEventHandler):
-    """
-    Excel 監控事件 Handler
-    - 處理 on_modified 事件
-    - 支援多執行緒安全
-    """
+    """處理檔案系統事件的 Handler"""
     def __init__(self):
         self.processing_files = {}
         self.lock = threading.Lock()
@@ -560,11 +648,12 @@ class ExcelChangeHandler(FileSystemEventHandler):
         if event.is_directory or not event.src_path.lower().endswith(SUPPORTED_EXTS) or os.path.basename(event.src_path).startswith('~$'):
             return
 
+        file_path = event.src_path
         current_time = time.time()
-        # 避免同一檔案短時間多次觸發
+
         with self.lock:
             last_processed_time = self.processing_files.get(file_path, 0)
-            if current_time - last_processed_time < 5:
+            if current_time - last_processed_time < 5:  # 5秒內不重複處理
                 return
             self.processing_files[file_path] = current_time
 
@@ -578,7 +667,7 @@ class ExcelChangeHandler(FileSystemEventHandler):
         event_counter += 1
 
 def start_watchdog_monitor():
-    """啟動 Watchdog 監控主程式"""
+    """啟動 Watchdog 監控"""
     global force_stop
     force_stop = False
     print("\n" + "=" * 80)
@@ -614,8 +703,6 @@ def print_console_header():
     print("="*80)
     print(f"  目前使用者: {os.getlogin()}")
 
-# ===================== 7. 主程式入口 =====================
-
 if __name__ == "__main__":
     try:
         print_console_header()
@@ -624,6 +711,10 @@ if __name__ == "__main__":
         if SCAN_ALL_MODE:
             all_files = get_all_excel_files(WATCH_FOLDERS)
             print(f"總共找到 {len(all_files)} 個 Excel 檔案。")
+            # baseline mode 顯示詳細
+            def dump_with_detail(path): return dump_excel_cells_with_timeout(path, show_sheet_detail=True)
+            # 你可以把 dump_excel_cells_with_timeout 換成 dump_with_detail
+            # 或者在 create_baseline_for_files_robust 裡調用時傳 show_sheet_detail=True
             create_baseline_for_files_robust(all_files, skip_force_baseline=True)
         else:
             target_files = get_all_excel_files(MANUAL_BASELINE_TARGET)
