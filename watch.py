@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Jul 10 16:29:38 2025
+
+@author: kccheng
+"""
+
 import os
 import time
 import csv
@@ -538,11 +545,230 @@ def create_baseline_for_files_robust(xlsx_files, skip_force_baseline=True):
         print(f"💾 本地緩存檔案存放於: {os.path.abspath(CACHE_FOLDER)}")
     print("=" * 90 + "\n")
 
+def compare_excel_changes(file_path):
+    """比較 Excel 檔案與 baseline 的變更"""
+    try:
+        base_name = os.path.basename(file_path)
+        baseline_file = baseline_file_path(base_name)
+        
+        # 載入 baseline
+        old_baseline = load_baseline(baseline_file)
+        if not old_baseline:
+            print(f"[INFO] 沒有 baseline: {base_name}，建立新 baseline...")
+            # 建立新 baseline
+            cell_data = dump_excel_cells_with_timeout(file_path)
+            curr_author = get_excel_last_author(file_path)
+            curr_hash = hash_excel_content(cell_data)
+            save_baseline(baseline_file, {
+                "last_author": curr_author,
+                "content_hash": curr_hash,
+                "cells": cell_data
+            })
+            return
+
+        # 讀取現在的檔案
+        curr_cells = dump_excel_cells_with_timeout(file_path)
+        curr_author = get_excel_last_author(file_path)
+        curr_hash = hash_excel_content(curr_cells)
+        
+        old_cells = old_baseline.get('cells', {})
+        old_author = old_baseline.get('last_author', '')
+        old_hash = old_baseline.get('content_hash', '')
+
+        # Hash 比較
+        if curr_hash == old_hash:
+            print(f"[INFO] 檔案無變更: {base_name}")
+            return
+
+        print(f"\n🚨 [檔案有變更] {base_name}")
+        print(f"  作者: {old_author} → {curr_author}")
+        print(f"  Hash: {old_hash[:8]}... → {curr_hash[:8]}...")
+        
+        # 詳細 cell 比較
+        changes = []
+        
+        # 找出所有 cell 位置
+        all_cells = set()
+        for ws_name in old_cells.keys():
+            all_cells.update([(ws_name, cell) for cell in old_cells[ws_name].keys()])
+        for ws_name in curr_cells.keys():
+            all_cells.update([(ws_name, cell) for cell in curr_cells[ws_name].keys()])
+        
+        for ws_name, cell_coord in all_cells:
+            old_cell = old_cells.get(ws_name, {}).get(cell_coord, {"formula": None, "value": None})
+            curr_cell = curr_cells.get(ws_name, {}).get(cell_coord, {"formula": None, "value": None})
+            
+            if old_cell != curr_cell:
+                changes.append({
+                    'worksheet': ws_name,
+                    'cell': cell_coord,
+                    'old_formula': old_cell['formula'],
+                    'old_value': old_cell['value'],
+                    'new_formula': curr_cell['formula'],
+                    'new_value': curr_cell['value']
+                })
+        
+        print_cell_changes_summary(changes)
+        
+        # 記錄到 CSV
+        log_changes_to_csv(file_path, curr_author, changes)
+        
+        # 更新 baseline
+        save_baseline(baseline_file, {
+            "last_author": curr_author,
+            "content_hash": curr_hash,
+            "cells": curr_cells
+        })
+        
+    except Exception as e:
+        print(f"[ERROR] 比較檔案失敗: {file_path} - {e}")
+
+def print_cell_changes_summary(changes, max_show=10):
+    """🎯 新格式的 cell 變更顯示"""
+    try:
+        print(f"  變更 cell 數量：{len(changes)}")
+        for i, change in enumerate(changes[:max_show]):
+            ws = change['worksheet']
+            cell = change['cell']
+            old_formula = change['old_formula'] or ""
+            old_value = change['old_value'] or ""
+            new_formula = change['new_formula'] or ""
+            new_value = change['new_value'] or ""
+            
+            # 檢查公式長度決定格式
+            formula_line = f"[公式: {old_formula}] -> [公式: {new_formula}]"
+            value_line = f"[值: {old_value}] -> [值: {new_value}]"
+            
+            # 如果公式行太長（超過 80 字符），就分行顯示
+            if len(formula_line) > 80:
+                print(f"    [{ws}] {cell}:")
+                print(f"        [公式: {old_formula}]")
+                print(f"        -> [公式: {new_formula}]")
+                print(f"        {value_line}")
+            else:
+                print(f"    [{ws}] {cell}:")
+                print(f"        {formula_line}")
+                print(f"        {value_line}")
+        
+        if len(changes) > max_show:
+            print(f"    ... 其餘 {len(changes) - max_show} 個 cell 省略 ...")
+    except Exception as e:
+        print(f"[ERROR][print_cell_changes_summary] {e}")
+
+def log_changes_to_csv(file_path, author, changes):
+    """記錄變更到 CSV"""
+    try:
+        os.makedirs(LOG_FOLDER, exist_ok=True)
+        
+        with gzip.open(CSV_LOG_FILE, 'at', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            
+            for change in changes:
+                writer.writerow([
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    file_path,
+                    author,
+                    change['worksheet'],
+                    change['cell'],
+                    change['old_formula'],
+                    change['old_value'],
+                    change['new_formula'],
+                    change['new_value']
+                ])
+    except Exception as e:
+        print(f"[ERROR] 記錄 CSV 失敗: {e}")
+
+def load_baseline(baseline_file):
+    """載入 baseline 檔案"""
+    try:
+        if os.path.exists(baseline_file):
+            with gzip.open(baseline_file, 'rt', encoding='utf-8') as f:
+                return json.load(f)
+        return None
+    except Exception as e:
+        print(f"[ERROR][load_baseline] {baseline_file}: {e}")
+        return None
+
 def print_console_header():
     print("\n" + "="*80)
     print(" Excel File Change Watcher (診斷強化版本) ".center(80, "-"))
     print("="*80 + "\n")
 
+def start_watchdog_monitor():
+    """啟動 Watchdog 監控"""
+    print("\n" + "=" * 80)
+    print(" 啟動 Excel 檔案監控 ".center(80, "="))
+    print("=" * 80)
+    
+    print("  監控資料夾:")
+    for folder in WATCH_FOLDERS:
+        print(f"    📂 {folder}")
+    
+    print(f"  支援檔案: {SUPPORTED_EXTS}")
+    print(f"  變更記錄: {CSV_LOG_FILE}")
+    print()
+    
+    event_handler = ExcelChangeHandler()
+    observer = Observer()
+    
+    for folder in WATCH_FOLDERS:
+        if os.path.exists(folder):
+            observer.schedule(event_handler, folder, recursive=True)
+            print(f"✅ 已監控: {folder}")
+        else:
+            print(f"❌ 資料夾不存在: {folder}")
+    
+    print("\n🔍 監控中... (按 Ctrl+C 停止)")
+    print("-" * 80)
+    
+    try:
+        observer.start()
+        while not force_stop:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n🛑 收到停止信號...")
+    finally:
+        observer.stop()
+        observer.join()
+        print("📄 監控已停止")
+
+class ExcelChangeHandler(FileSystemEventHandler):
+    def __init__(self):
+        self.processing_files = set()
+        
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+            
+        file_path = event.src_path
+        if not file_path.lower().endswith(SUPPORTED_EXTS):
+            return
+            
+        filename = os.path.basename(file_path)
+        if filename.startswith('~$'):
+            return
+            
+        # 避免重複處理同一檔案
+        if file_path in self.processing_files:
+            return
+            
+        self.processing_files.add(file_path)
+        
+        try:
+            # 等待檔案寫入完成
+            time.sleep(2)
+            
+            print(f"\n📝 [檔案修改事件] {filename}")
+            print(f"   完整路徑: {file_path}")
+            print(f"   時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # 比較變更
+            compare_excel_changes(file_path)
+            
+        except Exception as e:
+            print(f"[ERROR] 處理檔案事件失敗: {file_path} - {e}")
+        finally:
+            self.processing_files.discard(file_path)
 # ============= 其他函數保持原樣... ============
 
 if __name__ == "__main__":
@@ -587,7 +813,8 @@ if __name__ == "__main__":
             create_baseline_for_files_robust(target_files, skip_force_baseline=False)
             print("手動 baseline 完成！\n")
 
-        # 其他監控程式碼...
+        # 🚀 啟動 Watchdog 監控
+        start_watchdog_monitor()
         
     except Exception as e:
         print(f"[ERROR][main] 程式主流程 error: {e}")
