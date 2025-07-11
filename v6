@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
 """
+而家個程式遇到d array function 佢係print 背後memory address 既變動
+但user 關心既係條function 用既字眼有無變動
+
+另外有d case user edit 一d cell 會影響成張worksheet 重新計算
+令到d cell value 變晒
+但呢d cell 既背後其實條formula 無變到
+咁樣唔應該計做個change
+因為user 其實無edit 到其他cell
 Created on Fri Jul 11 17:49:32 2025
 
 @author: kccheng
