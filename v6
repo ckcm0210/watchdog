@@ -97,6 +97,13 @@ def pretty_formula(formula, ref_map=None):
     """ 顯示 formula 時，如果有 [n]Table! 這種 external workbook reference，會顯示來源路徑 """
     if formula is None:
         return None
+    
+    # 修改：處理 ArrayFormula 物件
+    if isinstance(formula, ArrayFormula):
+        formula_str = formula.text if hasattr(formula, 'text') else str(formula)
+    else:
+        formula_str = str(formula)
+    
     if ref_map:
         def repl(m):
             n = int(m.group(1))
@@ -105,9 +112,9 @@ def pretty_formula(formula, ref_map=None):
                 return f"[外部檔案{n}: {path}]{m.group(0)}"
             else:
                 return m.group(0)
-        return re.sub(r'\[(\d+)\][A-Za-z0-9_]+!', repl, str(formula))
+        return re.sub(r'\[(\d+)\][A-Za-z0-9_]+!', repl, formula_str)
     else:
-        return str(formula)
+        return formula_str
 
 def get_cell_formula(cell):
     """
@@ -115,9 +122,38 @@ def get_cell_formula(cell):
     """
     if cell.data_type == 'f':
         if isinstance(cell.value, ArrayFormula):
-            return str(cell.value)
+            # 修改：返回 ArrayFormula 的實際公式字符串，而不是物件
+            return cell.value.text if hasattr(cell.value, 'text') else str(cell.value)
         return cell.value
     return None
+
+def should_filter_change(change, formula_only_mode=True):
+    """
+    判斷是否要過濾這個變更
+    formula_only_mode: 如果為 True，只有公式變化才算變更，值變化不算
+    """
+    old_f, new_f = change.get('old_formula'), change.get('new_formula')
+    old_v, new_v = change.get('old_value'), change.get('new_value')
+    
+    # 如果是 formula_only_mode，只看公式變化
+    if formula_only_mode:
+        # 標準化公式字符串比較
+        old_f_str = str(old_f) if old_f is not None else None
+        new_f_str = str(new_f) if new_f is not None else None
+        
+        # 如果公式沒變，就過濾掉
+        if old_f_str == new_f_str:
+            return True
+        
+        # 如果兩邊都沒有公式，但值有變化，也過濾掉（這是重新計算導致的）
+        if old_f_str is None and new_f_str is None:
+            return True
+            
+        return False
+    else:
+        # 原來的邏輯：公式和值都沒變才過濾
+        return old_f == new_f and str(old_v) == str(new_v)
+
 
 def is_array_formula_obj(val):
     """
@@ -154,6 +190,7 @@ FILE_TIMEOUT_SECONDS = 120
 ENABLE_MEMORY_MONITOR = True
 MEMORY_LIMIT_MB = 2048
 ENABLE_RESUME = True
+FORMULA_ONLY_MODE = True
 RESUME_LOG_FILE = r"D:\Pzone\watchdog\\resume_log\baseline_progress.log"
 WATCH_FOLDERS = [
     r"V:\MD9\Current\2024\1_Rehearsal (2025.08.01)",
@@ -585,7 +622,7 @@ def compare_excel_changes(file_path, silent=True, event_number=None, is_polling=
                                     'new_formula': curr_cell['formula'], 'new_value': curr_cell['value']})
 
         ref_map = extract_external_refs(file_path)
-        filtered_changes = [enrich_formula_external_path(c, ref_map) for c in changes if not filter_array_formula_change(c)]
+        filtered_changes = [enrich_formula_external_path(c, ref_map) for c in changes if not should_filter_change(c, FORMULA_ONLY_MODE)]
         
         if not filtered_changes:
             if not is_polling: print("  [INFO] 內容有變更，但過濾後無顯著差異。")
@@ -616,17 +653,27 @@ def print_cell_changes_summary(changes, max_show=10):
             new_f, new_v = change['new_formula'] or "", str(change['new_value'] or "")
             print(f"    [{ws}] {cell}:")
             if old_f != new_f:
+                # 加入除錯信息
+                old_f_type = type(change['old_formula']).__name__ if change['old_formula'] else "None"
+                new_f_type = type(change['new_formula']).__name__ if change['new_formula'] else "None"
+                
                 old_f_str, new_f_str = str(old_f), str(new_f)
                 if len(old_f_str) > maxlen or len(new_f_str) > maxlen:
-                    print(f"        [公式] '{old_f_str}'\n              -> '{new_f_str}'")
-                else: print(f"        [公式] '{old_f_str}' -> '{new_f_str}'")
+                    print(f"        [公式] '{old_f_str}' ({old_f_type})")
+                    print(f"              -> '{new_f_str}' ({new_f_type})")
+                else: 
+                    print(f"        [公式] '{old_f_str}' ({old_f_type}) -> '{new_f_str}' ({new_f_type})")
             if str(old_v) != str(new_v):
                 old_v_str, new_v_str = str(old_v), str(new_v)
                 if len(old_v_str) > maxlen or len(new_v_str) > maxlen:
-                    print(f"        [值]   '{old_v_str}'\n              -> '{new_v_str}'")
-                else: print(f"        [值]   '{old_v_str}' -> '{new_v_str}'")
-        if len(changes) > max_show: print(f"    ... 其餘 {len(changes) - max_show} 個 cell 省略 ...")
-    except Exception as e: print(f"[ERROR][print_cell_changes_summary] {e}")
+                    print(f"        [值]   '{old_v_str}'")
+                    print(f"              -> '{new_v_str}'")
+                else: 
+                    print(f"        [值]   '{old_v_str}' -> '{new_v_str}'")
+        if len(changes) > max_show: 
+            print(f"    ... 其餘 {len(changes) - max_show} 個 cell 省略 ...")
+    except Exception as e: 
+        print(f"[ERROR][print_cell_changes_summary] {e}")
 
 def log_changes_to_csv(file_path, author, changes):
     try:
