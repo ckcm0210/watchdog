@@ -30,6 +30,10 @@ USE_LOCAL_CACHE = True
 ENABLE_FAST_MODE = True
 CACHE_FOLDER = r".\\excel_cache"
 
+# 🔧 變更檢測選項
+FORMULA_ONLY_COMPARISON = True  # True=只檢測公式變更, False=檢測公式和值變更
+ENABLE_ARRAY_FORMULA_FILTER = True  # 啟用 Array Formula 過濾功能
+
 # 🔧 診斷和恢復選項
 ENABLE_TIMEOUT = True          # 啟用超時保護
 FILE_TIMEOUT_SECONDS = 120     # 每個檔案最大處理時間 (秒)
@@ -177,6 +181,108 @@ def serialize_cell_value(value):
     else:
         return str(value)
 
+def get_cell_formula(cell):
+    """
+    正確提取 cell 的公式，處理 Array Formula 記憶體地址問題
+    """
+    if cell.data_type != "f":
+        return None
+    
+    try:
+        # 如果是 Array Formula，openpyxl 會返回 ArrayFormula 物件
+        # 我們需要提取實際的公式字符串而不是物件的記憶體地址
+        formula_value = cell.value
+        
+        # 處理 Array Formula 物件
+        if hasattr(formula_value, 'text'):
+            # ArrayFormula 物件有 text 屬性包含實際公式
+            formula_str = formula_value.text
+        elif hasattr(formula_value, 'ref') and hasattr(formula_value, 'formula'):
+            # 某些版本的 openpyxl 使用不同的結構
+            formula_str = formula_value.formula
+        else:
+            # 普通公式或其他情況
+            formula_str = str(formula_value)
+        
+        # 確保公式以 = 開頭
+        if formula_str and not formula_str.startswith("="):
+            formula_str = "=" + formula_str
+            
+        return formula_str
+        
+    except Exception as e:
+        # 如果提取失敗，返回字符串形式但去除可能的記憶體地址
+        try:
+            formula_str = str(cell.value)
+            # 移除可能的記憶體地址模式 (如 <ArrayFormula 'formula' (A1:B2)>)
+            import re
+            # 提取引號中的公式部分
+            match = re.search(r"'([^']*)'", formula_str)
+            if match:
+                formula_str = match.group(1)
+            
+            if formula_str and not formula_str.startswith("="):
+                formula_str = "=" + formula_str
+                
+            return formula_str
+        except:
+            return str(cell.value)
+
+def pretty_formula(formula):
+    """
+    美化公式顯示，去除記憶體地址和其他不必要的資訊
+    """
+    if not formula:
+        return formula
+    
+    try:
+        # 去除可能的記憶體地址模式
+        import re
+        
+        # 模式1: <ArrayFormula 'formula' (range)>
+        match = re.search(r"<ArrayFormula\s+'([^']+)'\s+\([^)]+\)>", formula)
+        if match:
+            return "=" + match.group(1) if not match.group(1).startswith("=") else match.group(1)
+        
+        # 模式2: <object at 0x...>
+        if re.search(r"<.*?at\s+0x[0-9a-fA-F]+>", formula):
+            # 如果包含記憶體地址，嘗試提取可能的公式部分
+            # 這種情況可能需要從原始 cell 重新提取
+            return "[Array Formula - 無法顯示]"
+        
+        # 普通公式，直接返回
+        return formula
+        
+    except Exception:
+        return formula
+
+def filter_array_formula_change(changes):
+    """
+    過濾 Array Formula 變更，移除僅因記憶體地址變動而產生的假變更
+    """
+    if not ENABLE_ARRAY_FORMULA_FILTER:
+        return changes
+    
+    filtered_changes = []
+    
+    for change in changes:
+        old_formula = change.get('old_formula')
+        new_formula = change.get('new_formula')
+        
+        # 如果兩個公式都存在，比較它們的實際內容
+        if old_formula and new_formula:
+            # 使用 pretty_formula 清理公式
+            clean_old = pretty_formula(old_formula)
+            clean_new = pretty_formula(new_formula)
+            
+            # 如果清理後的公式相同，則跳過這個變更
+            if clean_old == clean_new:
+                continue
+        
+        filtered_changes.append(change)
+    
+    return filtered_changes
+
 def get_excel_last_author(path):
     try:
         wb = load_workbook(path, read_only=True)
@@ -264,11 +370,7 @@ def dump_excel_cells_with_timeout(path):
                                           min_col=1, max_col=ws.max_column):
                         for cell in row:
                             if cell.value is not None:
-                                formula = None
-                                if cell.data_type == "f":
-                                    formula = str(cell.value)
-                                    if not formula.startswith("="):
-                                        formula = "=" + formula
+                                formula = get_cell_formula(cell)
                                 
                                 ws_data[cell.coordinate] = {
                                     "formula": formula,
@@ -295,16 +397,10 @@ def dump_excel_cells_with_timeout(path):
                 for row_formula, row_value in zip(ws_formula.iter_rows(), ws_value.iter_rows()):
                     for cell_formula, cell_value in zip(row_formula, row_value):
                         try:
-                            formula = cell_formula.value if cell_formula.data_type == "f" else None
+                            formula = get_cell_formula(cell_formula)
                             value = serialize_cell_value(cell_value.value)
                             
                             if formula or (value not in [None, ""]):
-                                if formula is not None:
-                                    formula = str(formula)
-                                    if not formula.startswith("="):
-                                        formula = "=" + formula
-                                    if not formula.startswith("'="):
-                                        formula = "'" + formula
                                 ws_data[cell_formula.coordinate] = {
                                     "formula": formula,
                                     "value": value
@@ -598,15 +694,41 @@ def compare_excel_changes(file_path):
             old_cell = old_cells.get(ws_name, {}).get(cell_coord, {"formula": None, "value": None})
             curr_cell = curr_cells.get(ws_name, {}).get(cell_coord, {"formula": None, "value": None})
             
-            if old_cell != curr_cell:
-                changes.append({
-                    'worksheet': ws_name,
-                    'cell': cell_coord,
-                    'old_formula': old_cell['formula'],
-                    'old_value': old_cell['value'],
-                    'new_formula': curr_cell['formula'],
-                    'new_value': curr_cell['value']
-                })
+            # 根據配置決定比較模式
+            if FORMULA_ONLY_COMPARISON:
+                # 只比較公式變更
+                if old_cell.get('formula') != curr_cell.get('formula'):
+                    changes.append({
+                        'worksheet': ws_name,
+                        'cell': cell_coord,
+                        'old_formula': old_cell['formula'],
+                        'old_value': old_cell['value'],
+                        'new_formula': curr_cell['formula'],
+                        'new_value': curr_cell['value'],
+                        'change_type': 'formula'
+                    })
+            else:
+                # 比較公式和值變更
+                if old_cell != curr_cell:
+                    # 判斷變更類型
+                    change_type = 'both'
+                    if old_cell.get('formula') != curr_cell.get('formula'):
+                        change_type = 'formula' if old_cell.get('value') == curr_cell.get('value') else 'both'
+                    elif old_cell.get('value') != curr_cell.get('value'):
+                        change_type = 'value'
+                    
+                    changes.append({
+                        'worksheet': ws_name,
+                        'cell': cell_coord,
+                        'old_formula': old_cell['formula'],
+                        'old_value': old_cell['value'],
+                        'new_formula': curr_cell['formula'],
+                        'new_value': curr_cell['value'],
+                        'change_type': change_type
+                    })
+        
+        # 過濾 Array Formula 假變更
+        changes = filter_array_formula_change(changes)
         
         print_cell_changes_summary(changes)
         
@@ -627,28 +749,52 @@ def print_cell_changes_summary(changes, max_show=10):
     """🎯 新格式的 cell 變更顯示"""
     try:
         print(f"  變更 cell 數量：{len(changes)}")
+        
+        # 統計變更類型
+        change_types = {}
+        for change in changes:
+            change_type = change.get('change_type', 'unknown')
+            change_types[change_type] = change_types.get(change_type, 0) + 1
+        
+        if change_types:
+            type_summary = ", ".join([f"{k}: {v}" for k, v in change_types.items()])
+            print(f"  變更類型統計：{type_summary}")
+        
         for i, change in enumerate(changes[:max_show]):
             ws = change['worksheet']
             cell = change['cell']
-            old_formula = change['old_formula'] or ""
+            old_formula = pretty_formula(change['old_formula']) or ""
             old_value = change['old_value'] or ""
-            new_formula = change['new_formula'] or ""
+            new_formula = pretty_formula(change['new_formula']) or ""
             new_value = change['new_value'] or ""
+            change_type = change.get('change_type', 'unknown')
             
-            # 檢查公式長度決定格式
-            formula_line = f"[公式: {old_formula}] -> [公式: {new_formula}]"
-            value_line = f"[值: {old_value}] -> [值: {new_value}]"
-            
-            # 如果公式行太長（超過 80 字符），就分行顯示
-            if len(formula_line) > 80:
-                print(f"    [{ws}] {cell}:")
-                print(f"        [公式: {old_formula}]")
-                print(f"        -> [公式: {new_formula}]")
-                print(f"        {value_line}")
+            # 根據變更類型決定顯示內容
+            if change_type == 'formula':
+                print(f"    [{ws}] {cell} [公式變更]:")
+                print(f"        [公式: {old_formula}] -> [公式: {new_formula}]")
+                if old_value != new_value:
+                    print(f"        [值: {old_value}] -> [值: {new_value}]")
+            elif change_type == 'value':
+                print(f"    [{ws}] {cell} [值變更]:")
+                if old_formula:
+                    print(f"        [公式: {old_formula}] (未變更)")
+                print(f"        [值: {old_value}] -> [值: {new_value}]")
             else:
-                print(f"    [{ws}] {cell}:")
-                print(f"        {formula_line}")
-                print(f"        {value_line}")
+                # 檢查公式長度決定格式
+                formula_line = f"[公式: {old_formula}] -> [公式: {new_formula}]"
+                value_line = f"[值: {old_value}] -> [值: {new_value}]"
+                
+                # 如果公式行太長（超過 80 字符），就分行顯示
+                if len(formula_line) > 80:
+                    print(f"    [{ws}] {cell}:")
+                    print(f"        [公式: {old_formula}]")
+                    print(f"        -> [公式: {new_formula}]")
+                    print(f"        {value_line}")
+                else:
+                    print(f"    [{ws}] {cell}:")
+                    print(f"        {formula_line}")
+                    print(f"        {value_line}")
         
         if len(changes) > max_show:
             print(f"    ... 其餘 {len(changes) - max_show} 個 cell 省略 ...")
@@ -670,10 +816,11 @@ def log_changes_to_csv(file_path, author, changes):
                     author,
                     change['worksheet'],
                     change['cell'],
-                    change['old_formula'],
+                    pretty_formula(change['old_formula']),
                     change['old_value'],
-                    change['new_formula'],
-                    change['new_value']
+                    pretty_formula(change['new_formula']),
+                    change['new_value'],
+                    change.get('change_type', 'unknown')
                 ])
     except Exception as e:
         print(f"[ERROR] 記錄 CSV 失敗: {e}")
@@ -791,6 +938,10 @@ if __name__ == "__main__":
             optimizations.append(f"記憶體監控({MEMORY_LIMIT_MB}MB)")
         if ENABLE_RESUME:
             optimizations.append("斷點續傳")
+        if FORMULA_ONLY_COMPARISON:
+            optimizations.append("公式專用比較")
+        if ENABLE_ARRAY_FORMULA_FILTER:
+            optimizations.append("Array公式過濾")
         
         print(f"  🚀 啟用功能: {', '.join(optimizations)}")
         print(f"  📂 Baseline 儲存位置: {os.path.abspath(LOG_FOLDER)}")
