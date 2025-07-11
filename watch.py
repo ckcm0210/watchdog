@@ -17,6 +17,9 @@ import gzip
 import json
 import signal
 import threading
+import zipfile
+import xml.etree.ElementTree as ET
+import re
 from datetime import datetime
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -167,15 +170,117 @@ def get_all_excel_files(folders):
     return all_files
 
 def serialize_cell_value(value):
-    """快速序列化"""
+    """快速序列化 - 增強版，支援 ArrayFormula 過濾"""
     if value is None:
         return None
     elif isinstance(value, datetime):
         return value.isoformat()
     elif isinstance(value, (int, float, str, bool)):
         return value
+    # 處理 ArrayFormula 對象 - 比較公式內容而非物件地址
+    elif type(value).__name__ == "ArrayFormula":
+        # 取得實際公式內容，避免物件地址差異導致的誤判
+        if hasattr(value, 'text'):
+            return str(value.text)
+        elif hasattr(value, 'formula'):
+            return str(value.formula)
+        else:
+            return str(value)
+    # 處理其他有 formula 屬性的物件
+    elif hasattr(value, 'formula'):
+        return str(value.formula)
     else:
         return str(value)
+
+def extract_external_links(excel_file_path):
+    """
+    從 Excel 檔案中提取外部連結映射
+    返回 [n] 索引到檔案路徑的映射字典
+    """
+    external_link_mapping = {}
+    
+    try:
+        with zipfile.ZipFile(excel_file_path, 'r') as zip_ref:
+            # 查找外部連結檔案
+            external_link_files = [name for name in zip_ref.namelist() 
+                                 if 'externalLink' in name.lower() and name.endswith('.xml')]
+            
+            if not external_link_files:
+                return external_link_mapping
+            
+            # 讀取 workbook 關係以取得外部連結映射
+            workbook_rels_path = None
+            for name in zip_ref.namelist():
+                if name.endswith('workbook.xml.rels'):
+                    workbook_rels_path = name
+                    break
+            
+            if not workbook_rels_path:
+                return external_link_mapping
+            
+            # 解析 workbook 關係
+            rels_content = zip_ref.read(workbook_rels_path)
+            rels_root = ET.fromstring(rels_content)
+            
+            # 查找外部連結關係
+            external_link_rels = {}
+            for rel in rels_root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
+                rel_type = rel.get('Type', '')
+                if 'externalLink' in rel_type:
+                    rel_id = rel.get('Id', '')
+                    target = rel.get('Target', '')
+                    external_link_rels[rel_id] = target
+            
+            # 解析每個外部連結檔案
+            for idx, ext_link_file in enumerate(external_link_files, 1):
+                try:
+                    ext_link_content = zip_ref.read(ext_link_file)
+                    ext_link_root = ET.fromstring(ext_link_content)
+                    
+                    # 查找外部書籍參照
+                    for ext_book in ext_link_root.findall('.//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}externalBook'):
+                        # 取得關係 ID
+                        rel_id = ext_book.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id', '')
+                        
+                        if rel_id in external_link_rels:
+                            target_path = external_link_rels[rel_id]
+                            # 使用檔案索引作為 [n] 的映射
+                            external_link_mapping[idx] = target_path
+                            break
+                                
+                except Exception as e:
+                    print(f"[DEBUG] 解析外部連結檔案 {ext_link_file} 時發生錯誤: {e}")
+                    continue
+            
+    except Exception as e:
+        print(f"[DEBUG] 從 {excel_file_path} 提取外部連結時發生錯誤: {e}")
+    
+    return external_link_mapping
+
+def resolve_external_references(formula, external_link_mapping):
+    """
+    使用外部連結映射解析公式中的 [n]Table! 參照
+    """
+    if not formula or not external_link_mapping:
+        return formula
+    
+    # 匹配 [n]Table! 或 [n]Sheet! 參照的模式
+    pattern = r'\[(\d+)\]([^!]+)!'
+    
+    def replace_ref(match):
+        index = int(match.group(1))
+        sheet_name = match.group(2)
+        
+        if index in external_link_mapping:
+            file_path = external_link_mapping[index]
+            # 從路徑中提取檔案名稱以供顯示
+            filename = os.path.basename(file_path) if file_path else f"ExternalFile{index}"
+            return f"[{filename}]{sheet_name}!"
+        else:
+            return match.group(0)  # 如果找不到則返回原值
+    
+    resolved_formula = re.sub(pattern, replace_ref, formula)
+    return resolved_formula
 
 def get_excel_last_author(path):
     try:
@@ -230,7 +335,7 @@ def copy_to_cache(network_path):
         return network_path
 
 def dump_excel_cells_with_timeout(path):
-    """🚀 帶超時保護的 Excel 讀取"""
+    """🚀 帶超時保護的 Excel 讀取 - 增強版，支援外部連結映射"""
     global current_processing_file, processing_start_time
     
     current_processing_file = path
@@ -243,6 +348,11 @@ def dump_excel_cells_with_timeout(path):
         
         # 使用本地緩存
         local_path = copy_to_cache(path)
+        
+        # 提取外部連結映射
+        external_link_mapping = extract_external_links(local_path)
+        if external_link_mapping:
+            print(f"   🔗 發現外部連結映射: {external_link_mapping}")
         
         if ENABLE_FAST_MODE:
             # 快速模式
@@ -269,6 +379,12 @@ def dump_excel_cells_with_timeout(path):
                                     formula = str(cell.value)
                                     if not formula.startswith("="):
                                         formula = "=" + formula
+                                    
+                                    # 解析外部連結參照
+                                    if external_link_mapping:
+                                        resolved_formula = resolve_external_references(formula, external_link_mapping)
+                                        if resolved_formula != formula:
+                                            formula = resolved_formula
                                 
                                 ws_data[cell.coordinate] = {
                                     "formula": formula,
@@ -305,6 +421,13 @@ def dump_excel_cells_with_timeout(path):
                                         formula = "=" + formula
                                     if not formula.startswith("'="):
                                         formula = "'" + formula
+                                    
+                                    # 解析外部連結參照
+                                    if external_link_mapping:
+                                        resolved_formula = resolve_external_references(formula, external_link_mapping)
+                                        if resolved_formula != formula:
+                                            formula = resolved_formula
+                                            
                                 ws_data[cell_formula.coordinate] = {
                                     "formula": formula,
                                     "value": value
@@ -624,10 +747,30 @@ def compare_excel_changes(file_path):
         print(f"[ERROR] 比較檔案失敗: {file_path} - {e}")
 
 def print_cell_changes_summary(changes, max_show=10):
-    """🎯 新格式的 cell 變更顯示"""
+    """🎯 新格式的 cell 變更顯示 - 增強版，支援 ArrayFormula 過濾提示"""
     try:
+        filtered_changes = []
+        array_formula_filtered = 0
+        
+        for change in changes:
+            old_formula = change['old_formula'] or ""
+            new_formula = change['new_formula'] or ""
+            old_value = change['old_value'] or ""
+            new_value = change['new_value'] or ""
+            
+            # 檢查是否為 ArrayFormula 物件地址變更但內容相同的情況
+            if (('ArrayFormula object at' in str(old_formula) or 
+                 'ArrayFormula object at' in str(new_formula)) and 
+                old_value == new_value):
+                array_formula_filtered += 1
+            else:
+                filtered_changes.append(change)
+        
         print(f"  變更 cell 數量：{len(changes)}")
-        for i, change in enumerate(changes[:max_show]):
+        if array_formula_filtered > 0:
+            print(f"  已過濾 ArrayFormula 物件地址變更：{array_formula_filtered} 個")
+        
+        for i, change in enumerate(filtered_changes[:max_show]):
             ws = change['worksheet']
             cell = change['cell']
             old_formula = change['old_formula'] or ""
@@ -650,8 +793,8 @@ def print_cell_changes_summary(changes, max_show=10):
                 print(f"        {formula_line}")
                 print(f"        {value_line}")
         
-        if len(changes) > max_show:
-            print(f"    ... 其餘 {len(changes) - max_show} 個 cell 省略 ...")
+        if len(filtered_changes) > max_show:
+            print(f"    ... 其餘 {len(filtered_changes) - max_show} 個 cell 省略 ...")
     except Exception as e:
         print(f"[ERROR][print_cell_changes_summary] {e}")
 
