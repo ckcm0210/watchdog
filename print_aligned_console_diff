@@ -1,0 +1,124 @@
+import shutil
+from wcwidth import wcswidth, wcwidth
+
+def wrap_text_with_cjk_support(text, width):
+    """
+    自研的、支持 CJK 字符寬度的智能文本換行函數。
+    徹底取代 textwrap。
+    """
+    lines = []
+    line = ""
+    current_width = 0
+    for char in text:
+        char_width = wcwidth(char)
+        if char_width < 0: continue # 跳過控制字符
+
+        if current_width + char_width > width:
+            lines.append(line)
+            line = char
+            current_width = char_width
+        else:
+            line += char
+            current_width += char_width
+    if line:
+        lines.append(line)
+    return lines or ['']
+
+def print_aligned_console_diff(old_data, new_data):
+    """
+    在 Console 中打印基於儲存格座標的、像素級完美對齊、支持自動換行，
+    並能區分 Add/Delete/Modify/Same 的差異報告。
+    這是一個專業命名的、可重用的生產級函數。
+    """
+    try:
+        term_width = shutil.get_terminal_size().columns
+    except OSError:
+        term_width = 120
+
+    col_width = (term_width // 2) - 4
+
+    def pad_str_to_visual_width(s, width):
+        """使用 wcwidth 來填充字串到指定的視覺寬度"""
+        padding = " " * (width - wcswidth(s))
+        return s + padding
+
+    def print_wrapped_row(left_text, right_text, left_prefix, right_prefix, color):
+        full_left_text = f"{left_prefix}{left_text}"
+        full_right_text = f"{right_prefix}{right_text}"
+        
+        wrapped_left = wrap_text_with_cjk_support(full_left_text, col_width)
+        wrapped_right = wrap_text_with_cjk_support(full_right_text, col_width)
+
+        num_lines = max(len(wrapped_left), len(wrapped_right))
+        for i in range(num_lines):
+            left_line = wrapped_left[i] if i < len(wrapped_left) else ""
+            right_line = wrapped_right[i] if i < len(wrapped_right) else ""
+            
+            padded_left = pad_str_to_visual_width(left_line, col_width)
+            padded_right = pad_str_to_visual_width(right_line, col_width)
+            
+            if color:
+                padded_left = f"{color}{padded_left}\033[0m"
+                padded_right = f"{color}{padded_right}\033[0m"
+            
+            print(f"{padded_left} | {padded_right}")
+
+    header_left = pad_str_to_visual_width('舊版本 (Baseline)', col_width)
+    header_right = pad_str_to_visual_width('新版本 (Current)', col_width)
+    
+    print("=" * (col_width * 2 + 3))
+    print(f"{header_left} | {header_right}")
+    print("-" * (col_width * 2 + 3))
+
+    all_keys = sorted(list(set(old_data.keys()) | set(new_data.keys())))
+
+    for key in all_keys:
+        old_val = old_data.get(key)
+        new_val = new_data.get(key)
+        line_text_old = f"{key}: '{old_val}'" if old_val is not None else ""
+        line_text_new = f"{key}: '{new_val}'" if new_val is not None else ""
+
+        if old_val is not None and new_val is not None:
+            if old_val == new_val:
+                print_wrapped_row(line_text_old, line_text_new, "[SAME] ", "[SAME] ", color="\033[90m")
+            else:
+                print_wrapped_row(line_text_old, line_text_new, "[MOD]  ", "[MOD]  ", color="\033[93m")
+        elif old_val is not None:
+            print_wrapped_row(line_text_old, "", "[DEL]  ", "", color="\033[91m")
+        else:
+            print_wrapped_row("", line_text_new, "", "[ADD]  ", color="\033[92m")
+            
+    print("-" * (col_width * 2 + 3))
+
+if __name__ == "__main__":
+    # --- 準備原始數據 ---
+    original_old = {
+        "Sheet1!A1": "Project Phoenix - Q3 Financial Report",
+        "Sheet1!F10": "=SUM(A2:A9)",
+        "Sheet1!C5": "Confidential - Do not distribute",
+        "Notes!B2": "Initial review completed by the finance team. All data seems correct but requires a final check from the department head before final submission."
+    }
+    original_new = {
+        "Sheet1!A1": "Project Phoenix - Q3 Financial Report",
+        "Sheet1!F10": "=SUM(A2:A8)",
+        "Notes!B2": "Final review completed by department head. All data is confirmed and approved for submission. A minor adjustment was made to the summary formula.",
+        "Tasks!B10": "Follow up with marketing team for Q4 forecast."
+    }
+
+    # --- 場景 A: 打印包含 [SAME] 的完整報告 ---
+    print("--- 場景 A: 完整報告 (包含 [SAME] 項，用於通用目的) ---")
+    print_aligned_console_diff(original_old, original_new)
+    
+    # --- 場景 B: 打印只含變更的報告 (Watchdog 專用) ---
+    print("\n\n--- 場景 B: 僅變更報告 (已過濾 [SAME] 項，用於 Watchdog) ---")
+    filtered_old = {}
+    filtered_new = {}
+    all_keys = set(original_old.keys()) | set(original_new.keys())
+    for key in all_keys:
+        old_val = original_old.get(key)
+        new_val = original_new.get(key)
+        if old_val != new_val:
+            if old_val is not None: filtered_old[key] = old_val
+            if new_val is not None: filtered_new[key] = new_val
+    
+    print_aligned_console_diff(filtered_old, filtered_new)
